@@ -1,0 +1,33 @@
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+
+public class SQLiteConnectionExample {
+
+    public static void main(String[] args) {
+        String url = "jdbc:sqlite:database.db"; // Replace with your DB file path
+
+        Connection conn = null;
+
+        try {
+            // Create a connection to the database
+            conn = DriverManager.getConnection(url);
+
+            if (conn != null) {
+                System.out.println("Connected to SQLite database successfully.");
+            }
+
+        } catch (SQLException e) {
+            System.out.println("Connection failed.");
+            e.printStackTrace();
+        } finally {
+            try {
+                if (conn != null) {
+                    conn.close();  // Close connection when done
+                }
+            } catch (SQLException ex) {
+                ex.printStackTrace();
+            }
+        }
+    }
+}
