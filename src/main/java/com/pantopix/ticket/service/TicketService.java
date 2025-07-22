@@ -1,18 +1,22 @@
 
 package com.pantopix.ticket.service;
+
+import com.pantopix.ticket.entities.Summary;
 import com.pantopix.ticket.entities.Ticket;
+import com.pantopix.ticket.model.TicketsPerPriority.Priority;
 import com.pantopix.ticket.repositories.TicketDeo;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.EnumMap;
 import java.util.Optional;
+import java.util.stream.StreamSupport;
 
 @Service
 public class TicketService {
 
     @Autowired
     private TicketDeo ticketDeo;
-
 
     public Ticket createNewTicket(Ticket ticket) {
         Ticket newTicket = new Ticket();
@@ -26,52 +30,85 @@ public class TicketService {
     }
 
     public Ticket updateExistingTicket(Ticket request) {
-            Optional<Ticket> existingProduct  = ticketDeo.findById(request.getId());
-        if (existingProduct .isPresent()) {
-        Ticket ticket = existingProduct.get();
-        ticket.setProblem(request.getProblem());
-        ticket.setCreatedBy(request.getCreatedBy());
-        ticket.setDesc(request.getDesc());
-        ticket.setStatus(request.getStatus());
-        ticket.setPriority(request.getPriority());
-        ticket.setAssignedTo(request.getAssignedTo());
-        return ticketDeo.save(ticket);
-}
+        Optional<Ticket> existingProduct = ticketDeo.findById(request.getId());
+        if (existingProduct.isPresent()) {
+            Ticket ticket = existingProduct.get();
+            ticket.setProblem(request.getProblem());
+            ticket.setCreatedBy(request.getCreatedBy());
+            ticket.setDesc(request.getDesc());
+            ticket.setStatus(request.getStatus());
+            ticket.setPriority(request.getPriority());
+            ticket.setAssignedTo(request.getAssignedTo());
+            return ticketDeo.save(ticket);
+        }
         return null;
-}
+    }
 
     public Iterable<Ticket> getAllTickets() {
         return ticketDeo.findAll();
     }
 
-        public  Ticket getTicket(Ticket getRequests) {
-            Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
-            if(getTicketById.isPresent()) {
-                Ticket ticket = getTicketById.get();
-                return ticket;
-            }
-            return null;
-}
+    public Ticket getTicket(Ticket getRequests) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
+        if (getTicketById.isPresent()) {
+            Ticket ticket = getTicketById.get();
+            return ticket;
+        }
+        return null;
+    }
 
+    public Summary getticketsPerPriority() {
+
+        Iterable<Ticket> tickets = ticketDeo.findAll();
+
+        long total = StreamSupport.stream(tickets.spliterator(), false)
+                .count();
+
+        long open = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("OPEN"))
+                .count();
+
+        long closed = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("CLOSED"))
+                .count();
+
+        long high = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("HIGH"))
+                .count();
+
+        long medium = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("MEDIUM"))
+                .count();
+
+        long low = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("LOW"))
+                .count();
+
+        EnumMap<Priority, Long> ticketsPerPriority = new EnumMap<>(Priority.class);
+        ticketsPerPriority.put(Priority.HIGH, high);
+        ticketsPerPriority.put(Priority.MEDIUM, medium);
+        ticketsPerPriority.put(Priority.LOW, low);
+
+        Summary newSummary = new Summary();
+        newSummary.setTotalTickets(total);
+        newSummary.setOpenTickets(open);
+        newSummary.setClosedTickets(closed);
+        newSummary.setTicketsPerPriority(ticketsPerPriority);
+
+        return newSummary;
+    }
 
     public boolean deleteTicket(Ticket getRequests) {
         Optional<Ticket> deleteTicketById = ticketDeo.findById(getRequests.getId());
-        if(deleteTicketById.isPresent()) {
-             ticketDeo.deleteById(getRequests.getId());
-             return true;
+        if (deleteTicketById.isPresent()) {
+            ticketDeo.deleteById(getRequests.getId());
+            return true;
+        } else {
+            return false;
+        }
     }
-       else {
-           return false;
-        }
+
+    public void deleteAllTickets() {
+        ticketDeo.deleteAll();
+    }
 }
-
-
-            public void deleteAllTickets() {
-                ticketDeo.deleteAll();
-            }
-        }
-
-
-
-
-
