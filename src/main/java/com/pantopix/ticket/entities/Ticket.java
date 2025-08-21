@@ -4,6 +4,7 @@ import com.pantopix.ticket.model.TicketStatus;
 import jakarta.persistence.*;
 
 import javax.validation.constraints.Email;
+import java.util.List;
 
 @Entity
 @Table(name = "ticket")
@@ -15,7 +16,7 @@ public class Ticket {
 
     private String problem;
 
-    private String desc;
+    private String description;
 
     private String priority;
     private TicketStatus status;
@@ -23,6 +24,16 @@ public class Ticket {
     private String CreatedBy;
     @Email(regexp = "[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,3}", message = "Invalid email address")
     private String AssignedTo;
+
+//    @ManyToMany
+//    @JoinTable(
+//            name = "ticket_category",
+//            joinColumns = @JoinColumn(name = "ticket_id"),
+//            inverseJoinColumns = @JoinColumn(name = "category_id")
+//    )
+//    private List<Category> ticketCategory;
+
+
 
     public Long getId() {
         return id;
@@ -41,11 +52,11 @@ public class Ticket {
     }
 
     public String getDesc() {
-        return desc;
+        return description;
     }
 
-    public void setDesc(String desc) {
-        this.desc = desc;
+    public void setDesc(String description) {
+        this.description = description;
     }
 
     public String getPriority() {
@@ -79,4 +90,15 @@ public class Ticket {
     public void setAssignedTo(String assignedTo) {
         AssignedTo = assignedTo;
     }
+//
+//    public List<Category> getCategory()
+//    {
+//        return ticketCategory;
+//    }
+//
+//    public void setCategory(List<Category> CategoryAssigned)
+//    {
+//        ticketCategory = CategoryAssigned;
+//
+//    }
 }
