@@ -1,17 +1,13 @@
-package com.pantopix.ticket.entities;
+package com.pantopix.ticket.common;
+
+import com.pantopix.ticket.entities.Category;
 import com.pantopix.ticket.model.TicketStatus;
-import jakarta.persistence.*;
+
 import javax.validation.constraints.Email;
 import java.util.HashSet;
 import java.util.Set;
 
-@Entity
-@Table(name = "ticket")
-public class Ticket {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+public class TicketDto {
     private String problem;
     private String desc;
     private String priority;
@@ -20,24 +16,7 @@ public class Ticket {
     private String CreatedBy;
     @Email(regexp = "[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,3}", message = "Invalid email address")
     private String AssignedTo;
-
-    @ManyToMany
-    @JoinTable(
-            name = "ticket_category",
-            joinColumns = @JoinColumn(name = "ticket_id"),
-            inverseJoinColumns = @JoinColumn(name = "category_id")
-    )
-    private Set<Category> categories = new HashSet<>();
-
-
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
+    private Set<CategoryDto> categories = new HashSet<>();
 
     public String getProblem() {
         return problem;
@@ -87,11 +66,11 @@ public class Ticket {
         AssignedTo = assignedTo;
     }
 
-    public Set<Category> getCategories() {
+    public Set<CategoryDto> getCategories() {
         return categories;
     }
 
-    public void setCategories(Set<Category> categories) {
+    public void setCategories(Set<CategoryDto> categories) {
         this.categories = categories;
     }
 }

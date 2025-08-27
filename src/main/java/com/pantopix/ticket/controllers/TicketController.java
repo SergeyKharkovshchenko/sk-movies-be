@@ -1,4 +1,7 @@
 package com.pantopix.ticket.controllers;
+
+import com.pantopix.ticket.common.TicketDto;
+import com.pantopix.ticket.entities.Category;
 import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.model.TicketStatus;
@@ -10,6 +13,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
+
 import java.util.List;
 import com.pantopix.ticket.service.TicketService;
 
@@ -27,7 +31,7 @@ public class  TicketController {
 
 
     @PostMapping("/save")
-    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated Ticket ticket) {
+    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated TicketDto ticket) {
         Ticket newTicket = ticketService.createNewTicket(ticket);
 
         String[] senders = new String[] {
@@ -128,5 +132,11 @@ public ResponseEntity<List<Ticket>> searchTickets(@RequestParam TicketStatus sta
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No ID found in database...............");
         }
         return ResponseEntity.ok(deletedId);
+    }
+
+    @DeleteMapping("/deleteAllCategories")
+    public ResponseEntity<Category> deleteAllCategories() {
+        ticketService.deleteAllCategories();
+        return new ResponseEntity<>(HttpStatus.OK);
     }
 }

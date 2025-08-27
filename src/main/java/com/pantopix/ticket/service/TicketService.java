@@ -2,17 +2,23 @@
 
 package com.pantopix.ticket.service;
 import com.pantopix.ticket.entities.Comment;
+import com.pantopix.ticket.common.CategoryDto;
+import com.pantopix.ticket.common.TicketDto;
+import com.pantopix.ticket.entities.Category;
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.CommentRepo;
+import com.pantopix.ticket.repositories.CategoryRepo;
 import com.pantopix.ticket.repositories.TicketDeo;
 import jakarta.persistence.EntityNotFoundException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import java.util.HashSet;
 
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 @Service
 public class TicketService {
@@ -26,8 +32,11 @@ public class TicketService {
 //    @Autowired
 //    private CategoryRepo categoryRepo;
 
+    @Autowired
+    private CategoryRepo categoryRepo;
 
-    public Ticket createNewTicket(Ticket ticket) {
+
+    public Ticket createNewTicket(TicketDto ticket) {
         Ticket newTicket = new Ticket();
         newTicket.setProblem(ticket.getProblem());
         newTicket.setCreatedBy(ticket.getCreatedBy());
@@ -35,23 +44,32 @@ public class TicketService {
         newTicket.setStatus(ticket.getStatus());
         newTicket.setPriority(ticket.getPriority());
         newTicket.setAssignedTo(ticket.getAssignedTo());
-//        newTicket.setCategory(ticket.getCategory());
+
+        Set<Category> validatedCategories = new HashSet<>();
+        for (CategoryDto category : ticket.getCategories()) {
+            Category found = categoryRepo.findByName(category.getCategoryName().name());
+            validatedCategories.add(found);
+            newTicket.setCategories(validatedCategories);
+        }
         return ticketDeo.save(newTicket);
 
     }
 
+
+
     public Ticket updateExistingTicket(Ticket request) {
-        Optional<Ticket> existingProduct = ticketDeo.findById(request.getId());
-        if (existingProduct.isPresent()) {
-            Ticket ticket = existingProduct.get();
-            ticket.setProblem(request.getProblem());
-            ticket.setCreatedBy(request.getCreatedBy());
-            ticket.setDesc(request.getDesc());
-            ticket.setStatus(request.getStatus());
-            ticket.setPriority(request.getPriority());
-            ticket.setAssignedTo(request.getAssignedTo());
-            return ticketDeo.save(ticket);
-        }
+        Optional<Ticket> existingProduct  = ticketDeo.findById(request.getId());
+        if (existingProduct .isPresent()) {
+        Ticket ticket = existingProduct.get();
+        ticket.setProblem(request.getProblem());
+        ticket.setCreatedBy(request.getCreatedBy());
+        ticket.setDesc(request.getDesc());
+        ticket.setStatus(request.getStatus());
+        ticket.setPriority(request.getPriority());
+        ticket.setAssignedTo(request.getAssignedTo());
+        ticket.setCategories(ticket.getCategories());
+        return ticketDeo.save(ticket);
+}
         return null;
     }
 
@@ -59,30 +77,36 @@ public class TicketService {
         return ticketDeo.findAll();
     }
 
-    public Ticket getTicket(Ticket getRequests) {
-        Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
-        if (getTicketById.isPresent()) {
-            Ticket ticket = getTicketById.get();
-            return ticket;
-        }
-        return null;
-    }
+        public  Ticket getTicket(Ticket getRequests) {
+            Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
+            if(getTicketById.isPresent()) {
+                Ticket ticket = getTicketById.get();
+                return ticket;
+            }
+            return null;
+}
 
 
     public boolean deleteTicket(Ticket getRequests) {
         Optional<Ticket> deleteTicketById = ticketDeo.findById(getRequests.getId());
-        if (deleteTicketById.isPresent()) {
-            ticketDeo.deleteById(getRequests.getId());
-            return true;
-        } else {
-            return false;
+        if(deleteTicketById.isPresent()) {
+             ticketDeo.deleteById(getRequests.getId());
+             return true;
+    }
+       else {
+           return false;
         }
-    }
+}
 
 
-    public void deleteAllTickets() {
-        ticketDeo.deleteAll();
+     public void deleteAllTickets() {
+                ticketDeo.deleteAll();
+            }
+
+    public void deleteAllCategories() {
+        categoryRepo.deleteAll();
     }
+
 
     public List<Ticket> searchTickets(TicketStatus status, String keyword) {
         return ticketDeo.findAllByStatusAndProblem(status, keyword);
@@ -128,11 +152,6 @@ public class TicketService {
 
     }
 }
-
-
-
-
-
 
 
 
