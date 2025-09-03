@@ -148,9 +148,7 @@ public class TicketService {
     }
 
 }
-     public void deleteAllTickets() {
-                ticketDeo.deleteAll();
-            }
+
 
     public void deleteAllCategories() {
         categoryRepo.deleteAll();
