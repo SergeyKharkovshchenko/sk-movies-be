@@ -1,11 +1,14 @@
 package com.pantopix.ticket.controllers;
 
+import com.pantopix.ticket.common.TicketDto;
+import com.pantopix.ticket.entities.Category;
+import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.entities.User;
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.TicketDeo;
 import com.pantopix.ticket.service.EmailService;
-import com.pantopix.ticket.service.TicketService;
+import jakarta.persistence.EntityNotFoundException;
 
 import org.hibernate.Remove;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,11 +17,11 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.List;
+import com.pantopix.ticket.service.TicketService;
 
 @RestController
-public class TicketController {
+public class  TicketController {
 
     @Autowired
     private TicketDeo ticketDeo;
@@ -30,21 +33,13 @@ public class TicketController {
     private TicketService ticketService;
 
     @PostMapping("/save")
-    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated Ticket ticket) {
+    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated TicketDto ticket) {
         Ticket newTicket = ticketService.createNewTicket(ticket);
 
         String[] senders = new String[] {
                 newTicket.getCreatedBy(),
                 newTicket.getAssignedTo()
         };
-        // final String regex = "^(.+)@(.+)$";
-        // Pattern pattern = Pattern.compile(regex);
-        // //searching for occurrences of regex
-        // for (String value : senders) {
-        // Matcher matcher = pattern.matcher(value);
-        // System.out.println("Email " + value + " is " + (matcher.matches() ? "valid" :
-        // "invalid"));
-        // }
         emailService.sendSimpleEmail(
                 senders,
                 "New ticket has been created",
@@ -102,22 +97,49 @@ public class TicketController {
         return new ResponseEntity<>(HttpStatus.OK);
     }
 
-    @GetMapping("/api/tickets/{ticketId}/watchers")
-    public ResponseEntity<Iterable<User>> getAllWatchersByTicketId(@PathVariable Long ticketId) {
-        Iterable<User> watchersByTicketId = ticketService.getAllWatchersByTicketId(ticketId);
-        return ResponseEntity.ok(watchersByTicketId);
+
+@GetMapping("/search")
+public ResponseEntity<List<Ticket>> searchTickets(@RequestParam TicketStatus status, @RequestParam String  keyword) {
+    List<Ticket> searchByTicket =  ticketService.searchTickets(status, keyword);
+    return ResponseEntity.ok(searchByTicket);
     }
 
-    @PutMapping("/api/tickets/{ticketId}/watchers/{userId}")
-    public ResponseEntity<Ticket> addWatcherToTicket(@PathVariable Long ticketId, @PathVariable Long userId) {
-        Ticket updatedTicket = ticketService.addWatcherToTicketById(ticketId, userId);
-        return ResponseEntity.ok(updatedTicket);
+
+    @PostMapping("/{ticketId}/comments")
+    public Comment createComment(@PathVariable("ticketId") Long id, @RequestBody Comment comment) {
+        return ticketService.createComment(id, comment);
     }
 
-    @DeleteMapping("/api/tickets/{ticketId}/watchers/{userId}")
-    public ResponseEntity<Ticket> removeWatcherFromTicket(@PathVariable Long ticketId, @PathVariable Long userId) {
-        Ticket updatedTicket = ticketService.removeWatcherFromTicket(ticketId, userId);
-        return ResponseEntity.ok(updatedTicket);
+
+    @GetMapping("/{ticketId}/listComments")
+    public ResponseEntity<List<Comment>> listComments(@PathVariable Long ticketId) {
+        List<Comment> comments = ticketService.getCommentById(ticketId);
+      return ResponseEntity.ok(comments);
     }
 
+    @PutMapping("/updateComment")
+    public ResponseEntity<?> updateExistingComment(@RequestBody Comment comment) {
+        try {
+        Comment result = ticketService.updateExistingComment(comment.getCommentId(), comment);
+        return ResponseEntity.ok(result);
+        } catch (EntityNotFoundException ex) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Comment not found.");
+        }
+    }
+
+
+    @DeleteMapping("/deleteComment/{id}")
+    public ResponseEntity<?> deleteComment(@PathVariable("id") Long id) {
+        boolean deletedId = ticketService.deleteComment(id);
+        if(!deletedId ) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No ID found in database...............");
+        }
+        return ResponseEntity.ok(deletedId);
+    }
+
+    @DeleteMapping("/deleteAllCategories")
+    public ResponseEntity<Category> deleteAllCategories() {
+        ticketService.deleteAllCategories();
+        return new ResponseEntity<>(HttpStatus.OK);
+    }
 }
