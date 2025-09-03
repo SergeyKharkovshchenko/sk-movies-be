@@ -1,6 +1,11 @@
 package com.pantopix.ticket.entities;
 import com.pantopix.ticket.model.TicketStatus;
 import jakarta.persistence.*;
+
+import java.util.HashSet;
+import java.util.Locale.Category;
+import java.util.Set;
+
 import javax.validation.constraints.Email;
 import java.util.HashSet;
 import java.util.Set;
@@ -93,5 +98,17 @@ public class Ticket {
 
     public void setCategories(Set<Category> categories) {
         this.categories = categories;
+    }
+
+    @ManyToMany
+    @JoinTable(name = "ticket_watchers", joinColumns = @JoinColumn(name = "ticket_id"), inverseJoinColumns = @JoinColumn(name = "user_id"))
+    private Set<User> watchers = new HashSet<>();
+
+    public Set<User> getWatchers() {
+        return watchers;
+    }
+
+    public void setWatchers(Set<User> watchers) {
+        this.watchers = watchers;
     }
 }

@@ -5,12 +5,15 @@ import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.common.CategoryDto;
 import com.pantopix.ticket.common.TicketDto;
 import com.pantopix.ticket.entities.Category;
+
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.CommentRepo;
 import com.pantopix.ticket.repositories.CategoryRepo;
+import com.pantopix.ticket.entities.User;
 import com.pantopix.ticket.repositories.TicketDeo;
 import jakarta.persistence.EntityNotFoundException;
+import com.pantopix.ticket.repositories.UserDeo;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import java.util.HashSet;
@@ -26,6 +29,8 @@ public class TicketService {
     @Autowired
     private TicketDeo ticketDeo;
 
+    @Autowired
+    private UserDeo userDeo;
     @Autowired
     private CommentRepo commentRepo;
 
@@ -77,31 +82,73 @@ public class TicketService {
         return ticketDeo.findAll();
     }
 
-        public  Ticket getTicket(Ticket getRequests) {
-            Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
-            if(getTicketById.isPresent()) {
-                Ticket ticket = getTicketById.get();
-                return ticket;
-            }
-            return null;
-}
-
+    public Ticket getTicket(Ticket getRequests) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
+        if (getTicketById.isPresent()) {
+            Ticket ticket = getTicketById.get();
+            return ticket;
+        }
+        return null;
+    }
 
     public boolean deleteTicket(Ticket getRequests) {
         Optional<Ticket> deleteTicketById = ticketDeo.findById(getRequests.getId());
-        if(deleteTicketById.isPresent()) {
-             ticketDeo.deleteById(getRequests.getId());
-             return true;
-    }
-       else {
-           return false;
+        if (deleteTicketById.isPresent()) {
+            ticketDeo.deleteById(getRequests.getId());
+            return true;
+        } else {
+            return false;
         }
+    }
+
+    public void deleteAllTickets() {
+        ticketDeo.deleteAll();
+    }
+
+    public Set<User> getAllWatchersByTicketId(Long ticketId) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(ticketId);
+        Ticket ticket = getTicketById.get();
+        return ticket.getWatchers();
+    }
+
+    public Ticket addWatcherToTicketById(Long ticketId, Long userId) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(ticketId);
+        Optional<User> getUserById = userDeo.findById(userId);
+        if (getTicketById.isPresent()) {
+            Ticket ticket = getTicketById.get();
+            User user = getUserById.get();
+
+            Set<User> watchers = ticket.getWatchers();
+            if (watchers == null) {
+                watchers = new java.util.HashSet<>();
+            }
+            watchers.add(user);
+            ticket.setWatchers(watchers);
+            return ticketDeo.save(ticket);
+        }
+        return null;
+    }
+
+    public Ticket removeWatcherFromTicket(Long ticketId, Long userId) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(ticketId);
+        Optional<User> getUserById = userDeo.findById(userId);
+
+        if (getTicketById.isPresent() && getUserById.isPresent()) {
+            Ticket ticket = getTicketById.get();
+            User user = getUserById.get();
+
+            Set<User> watchers = ticket.getWatchers();
+            if (watchers != null && watchers.contains(user)) {
+                watchers.remove(user);
+                ticket.setWatchers(watchers);
+                return ticketDeo.save(ticket);
+            }
+        }
+        return null;
+    }
+
 }
 
-
-     public void deleteAllTickets() {
-                ticketDeo.deleteAll();
-            }
 
     public void deleteAllCategories() {
         categoryRepo.deleteAll();
