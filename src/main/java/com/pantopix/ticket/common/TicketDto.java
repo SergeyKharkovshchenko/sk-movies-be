@@ -1,49 +1,22 @@
-package com.pantopix.ticket.entities;
-import com.pantopix.ticket.model.TicketPriority;
-import com.pantopix.ticket.model.TicketStatus;
-import jakarta.persistence.*;
+package com.pantopix.ticket.common;
 
-import java.util.HashSet;
-import java.util.Locale.Category;
-import java.util.Set;
+import com.pantopix.ticket.entities.Category;
+import com.pantopix.ticket.model.TicketStatus;
 
 import javax.validation.constraints.Email;
+import java.util.HashSet;
+import java.util.Set;
 
-@Entity
-@Table(name = "ticket")
-public class Ticket {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
+public class TicketDto {
     private String problem;
     private String desc;
     private String priority;
-
-    private TicketPriority priority;
     private TicketStatus status;
     @Email(regexp = "[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,3}", message = "Invalid email address")
     private String CreatedBy;
     @Email(regexp = "[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,3}", message = "Invalid email address")
     private String AssignedTo;
-
-    @ManyToMany
-    @JoinTable(
-            name = "ticket_category",
-            joinColumns = @JoinColumn(name = "ticket_id"),
-            inverseJoinColumns = @JoinColumn(name = "category_id")
-    )
-    private Set<Category> categories = new HashSet<>();
-
-
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
+    private Set<CategoryDto> categories = new HashSet<>();
 
     public String getProblem() {
         return problem;
@@ -61,11 +34,11 @@ public class Ticket {
         this.desc = desc;
     }
 
-    public TicketPriority getPriority() {
+    public String getPriority() {
         return priority;
     }
 
-    public void setPriority(TicketPriority priority) {
+    public void setPriority(String priority) {
         this.priority = priority;
     }
 
@@ -93,24 +66,11 @@ public class Ticket {
         AssignedTo = assignedTo;
     }
 
-    public Set<Category> getCategories() {
+    public Set<CategoryDto> getCategories() {
         return categories;
     }
 
-    public void setCategories(Set<Category> categories) {
+    public void setCategories(Set<CategoryDto> categories) {
         this.categories = categories;
     }
-
-    @ManyToMany
-    @JoinTable(name = "ticket_watchers", joinColumns = @JoinColumn(name = "ticket_id"), inverseJoinColumns = @JoinColumn(name = "user_id"))
-    private Set<User> watchers = new HashSet<>();
-
-    public Set<User> getWatchers() {
-        return watchers;
-    }
-
-    public void setWatchers(Set<User> watchers) {
-        this.watchers = watchers;
-    }
 }
-

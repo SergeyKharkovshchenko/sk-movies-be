@@ -1,12 +1,18 @@
 package com.pantopix.ticket.controllers;
 
+import com.pantopix.ticket.common.TicketDto;
+import com.pantopix.ticket.entities.Category;
+import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.entities.Ticket;
+import com.pantopix.ticket.entities.User;
 import com.pantopix.ticket.entities.Summary;
 
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.TicketDeo;
 import com.pantopix.ticket.service.EmailService;
-import com.pantopix.ticket.service.TicketService;
+import jakarta.persistence.EntityNotFoundException;
+
+import org.hibernate.Remove;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -15,13 +21,15 @@ import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
+import com.pantopix.ticket.service.TicketService;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @RestController
-public class TicketController {
+public class  TicketController {
 
     @Autowired
     private TicketDeo ticketDeo;
@@ -57,7 +65,7 @@ public class TicketController {
     }
 
     @PostMapping("/save")
-    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated Ticket ticket) {
+    public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated TicketDto ticket) {
         Ticket newTicket = ticketService.createNewTicket(ticket);
 
         String[] senders = new String[] {
@@ -103,7 +111,9 @@ public class TicketController {
         }
 
         return ResponseEntity.ok(getTicketById);
+        return ResponseEntity.ok(getTicketById);
 
+    }
     }
 
     @DeleteMapping("/deleteTicket")
@@ -127,4 +137,50 @@ public class TicketController {
         return ResponseEntity.ok(ticketsPerPriority);
     }
 
+
+
+@GetMapping("/search")
+public ResponseEntity<List<Ticket>> searchTickets(@RequestParam TicketStatus status, @RequestParam String  keyword) {
+    List<Ticket> searchByTicket =  ticketService.searchTickets(status, keyword);
+    return ResponseEntity.ok(searchByTicket);
+    }
+
+
+    @PostMapping("/{ticketId}/comments")
+    public Comment createComment(@PathVariable("ticketId") Long id, @RequestBody Comment comment) {
+        return ticketService.createComment(id, comment);
+    }
+
+
+    @GetMapping("/{ticketId}/listComments")
+    public ResponseEntity<List<Comment>> listComments(@PathVariable Long ticketId) {
+        List<Comment> comments = ticketService.getCommentById(ticketId);
+      return ResponseEntity.ok(comments);
+    }
+
+    @PutMapping("/updateComment")
+    public ResponseEntity<?> updateExistingComment(@RequestBody Comment comment) {
+        try {
+        Comment result = ticketService.updateExistingComment(comment.getCommentId(), comment);
+        return ResponseEntity.ok(result);
+        } catch (EntityNotFoundException ex) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Comment not found.");
+        }
+    }
+
+
+    @DeleteMapping("/deleteComment/{id}")
+    public ResponseEntity<?> deleteComment(@PathVariable("id") Long id) {
+        boolean deletedId = ticketService.deleteComment(id);
+        if(!deletedId ) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No ID found in database...............");
+        }
+        return ResponseEntity.ok(deletedId);
+    }
+
+    @DeleteMapping("/deleteAllCategories")
+    public ResponseEntity<Category> deleteAllCategories() {
+        ticketService.deleteAllCategories();
+        return new ResponseEntity<>(HttpStatus.OK);
+    }
 }
