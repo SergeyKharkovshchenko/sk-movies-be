@@ -5,6 +5,8 @@ import com.pantopix.ticket.entities.Category;
 import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.entities.User;
+import com.pantopix.ticket.entities.Summary;
+
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.TicketDeo;
 import com.pantopix.ticket.service.EmailService;
@@ -14,11 +16,17 @@ import org.hibernate.Remove;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import com.pantopix.ticket.service.TicketService;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @RestController
 public class  TicketController {
@@ -31,6 +39,30 @@ public class  TicketController {
 
     @Autowired
     private TicketService ticketService;
+
+    @ControllerAdvice
+    public class GlobalExceptionHandler {
+
+        @ExceptionHandler(HttpMessageNotReadableException.class)
+        public ResponseEntity<Object> handleInvalidEnum(HttpMessageNotReadableException ex) {
+            String message = ex.getMessage();
+            String field = "Unknown field";
+            String enumOptions = "Unknown field";
+
+            if (message.toLowerCase().contains("priority")) {
+                field = "priority";
+                enumOptions = "LOW, HIGH, MEDIUM";
+            } else if (message.toLowerCase().contains("status")) {
+                field = "status";
+                enumOptions = "OPEN, IN_PROGRESS, DONE, CLOSED";
+            }
+
+            Map<String, String> response = new HashMap<>();
+            response.put("error", "Invalid value for enum field: " + field + ". Accepted values are: " + enumOptions);
+            return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+        }
+
+    }
 
     @PostMapping("/save")
     public ResponseEntity<Ticket> createNewTicket(@RequestBody @Validated TicketDto ticket) {
@@ -79,7 +111,9 @@ public class  TicketController {
         }
 
         return ResponseEntity.ok(getTicketById);
+        return ResponseEntity.ok(getTicketById);
 
+    }
     }
 
     @DeleteMapping("/deleteTicket")
@@ -96,6 +130,13 @@ public class  TicketController {
         ticketService.deleteAllTickets();
         return new ResponseEntity<>(HttpStatus.OK);
     }
+
+    @GetMapping("/dashboard/summary")
+    public ResponseEntity<Summary> getSummary() {
+        Summary ticketsPerPriority = ticketService.getticketsPerPriority();
+        return ResponseEntity.ok(ticketsPerPriority);
+    }
+
 
 
 @GetMapping("/search")

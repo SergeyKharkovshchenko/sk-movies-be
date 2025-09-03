@@ -6,11 +6,14 @@ import com.pantopix.ticket.common.CategoryDto;
 import com.pantopix.ticket.common.TicketDto;
 import com.pantopix.ticket.entities.Category;
 
+
+import com.pantopix.ticket.entities.Summary;
 import com.pantopix.ticket.entities.Ticket;
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.CommentRepo;
 import com.pantopix.ticket.repositories.CategoryRepo;
 import com.pantopix.ticket.entities.User;
+import com.pantopix.ticket.model.TicketsPerPriority.Priority;
 import com.pantopix.ticket.repositories.TicketDeo;
 import jakarta.persistence.EntityNotFoundException;
 import com.pantopix.ticket.repositories.UserDeo;
@@ -18,9 +21,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import java.util.HashSet;
 
+import java.util.EnumMap;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.StreamSupport;
 import java.util.Set;
 
 @Service
@@ -77,6 +82,7 @@ public class TicketService {
 }
         return null;
     }
+    }
 
     public Iterable<Ticket> getAllTickets() {
         return ticketDeo.findAll();
@@ -89,6 +95,47 @@ public class TicketService {
             return ticket;
         }
         return null;
+    }
+
+    public Summary getticketsPerPriority() {
+
+        Iterable<Ticket> tickets = ticketDeo.findAll();
+
+        long total = StreamSupport.stream(tickets.spliterator(), false)
+                .count();
+
+        long open = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("OPEN"))
+                .count();
+
+        long closed = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("CLOSED"))
+                .count();
+
+        long high = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("HIGH"))
+                .count();
+
+        long medium = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("MEDIUM"))
+                .count();
+
+        long low = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("LOW"))
+                .count();
+
+        EnumMap<Priority, Long> ticketsPerPriority = new EnumMap<>(Priority.class);
+        ticketsPerPriority.put(Priority.HIGH, high);
+        ticketsPerPriority.put(Priority.MEDIUM, medium);
+        ticketsPerPriority.put(Priority.LOW, low);
+
+        Summary newSummary = new Summary();
+        newSummary.setTotalTickets(total);
+        newSummary.setOpenTickets(open);
+        newSummary.setClosedTickets(closed);
+        newSummary.setTicketsPerPriority(ticketsPerPriority);
+
+        return newSummary;
     }
 
     public boolean deleteTicket(Ticket getRequests) {
