@@ -1,14 +1,14 @@
 
-
 package com.pantopix.ticket.service;
+
 import com.pantopix.ticket.entities.Comment;
 import com.pantopix.ticket.common.CategoryDto;
 import com.pantopix.ticket.common.TicketDto;
 import com.pantopix.ticket.entities.Category;
 
-
 import com.pantopix.ticket.entities.Summary;
 import com.pantopix.ticket.entities.Ticket;
+import com.pantopix.ticket.model.CategoryStatus;
 import com.pantopix.ticket.model.TicketStatus;
 import com.pantopix.ticket.repositories.CommentRepo;
 import com.pantopix.ticket.repositories.CategoryRepo;
@@ -39,12 +39,8 @@ public class TicketService {
     @Autowired
     private CommentRepo commentRepo;
 
-//    @Autowired
-//    private CategoryRepo categoryRepo;
-
     @Autowired
     private CategoryRepo categoryRepo;
-
 
     public Ticket createNewTicket(TicketDto ticket) {
         Ticket newTicket = new Ticket();
@@ -59,29 +55,26 @@ public class TicketService {
         for (CategoryDto category : ticket.getCategories()) {
             Category found = categoryRepo.findByName(category.getCategoryName().name());
             validatedCategories.add(found);
-            newTicket.setCategories(validatedCategories);
         }
+        newTicket.setCategories(validatedCategories);
+
         return ticketDeo.save(newTicket);
-
     }
-
-
 
     public Ticket updateExistingTicket(Ticket request) {
-        Optional<Ticket> existingProduct  = ticketDeo.findById(request.getId());
-        if (existingProduct .isPresent()) {
-        Ticket ticket = existingProduct.get();
-        ticket.setProblem(request.getProblem());
-        ticket.setCreatedBy(request.getCreatedBy());
-        ticket.setDesc(request.getDesc());
-        ticket.setStatus(request.getStatus());
-        ticket.setPriority(request.getPriority());
-        ticket.setAssignedTo(request.getAssignedTo());
-        ticket.setCategories(ticket.getCategories());
-        return ticketDeo.save(ticket);
-}
+        Optional<Ticket> existingProduct = ticketDeo.findById(request.getId());
+        if (existingProduct.isPresent()) {
+            Ticket ticket = existingProduct.get();
+            ticket.setProblem(request.getProblem());
+            ticket.setCreatedBy(request.getCreatedBy());
+            ticket.setDesc(request.getDesc());
+            ticket.setStatus(request.getStatus());
+            ticket.setPriority(request.getPriority());
+            ticket.setAssignedTo(request.getAssignedTo());
+            ticket.setCategories(ticket.getCategories());
+            return ticketDeo.save(ticket);
+        }
         return null;
-    }
     }
 
     public Iterable<Ticket> getAllTickets() {
@@ -194,13 +187,9 @@ public class TicketService {
         return null;
     }
 
-}
-
-
     public void deleteAllCategories() {
         categoryRepo.deleteAll();
     }
-
 
     public List<Ticket> searchTickets(TicketStatus status, String keyword) {
         return ticketDeo.findAllByStatusAndProblem(status, keyword);
@@ -246,7 +235,3 @@ public class TicketService {
 
     }
 }
-
-
-
-

@@ -109,12 +109,9 @@ public class  TicketController {
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .body("The ticket with ID  does not exist.");
         }
-
         return ResponseEntity.ok(getTicketById);
-        return ResponseEntity.ok(getTicketById);
-
     }
-    }
+    
 
     @DeleteMapping("/deleteTicket")
     public ResponseEntity<?> deleteTicket(@RequestBody Ticket getRequests) {

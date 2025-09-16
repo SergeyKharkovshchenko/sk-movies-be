@@ -1,6 +1,7 @@
 package com.pantopix.ticket.common;
 
 import com.pantopix.ticket.entities.Category;
+import com.pantopix.ticket.model.TicketPriority;
 import com.pantopix.ticket.model.TicketStatus;
 
 import javax.validation.constraints.Email;
@@ -10,7 +11,7 @@ import java.util.Set;
 public class TicketDto {
     private String problem;
     private String desc;
-    private String priority;
+    private TicketPriority priority;
     private TicketStatus status;
     @Email(regexp = "[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,3}", message = "Invalid email address")
     private String CreatedBy;
@@ -34,11 +35,11 @@ public class TicketDto {
         this.desc = desc;
     }
 
-    public String getPriority() {
+    public TicketPriority getPriority() {
         return priority;
     }
 
-    public void setPriority(String priority) {
+    public void setPriority(TicketPriority priority) {
         this.priority = priority;
     }
 
@@ -73,4 +74,5 @@ public class TicketDto {
     public void setCategories(Set<CategoryDto> categories) {
         this.categories = categories;
     }
+
 }

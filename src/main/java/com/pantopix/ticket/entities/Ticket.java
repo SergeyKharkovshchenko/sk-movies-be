@@ -4,7 +4,6 @@ import com.pantopix.ticket.model.TicketStatus;
 import jakarta.persistence.*;
 
 import java.util.HashSet;
-import java.util.Locale.Category;
 import java.util.Set;
 
 import javax.validation.constraints.Email;
@@ -13,12 +12,13 @@ import javax.validation.constraints.Email;
 @Table(name = "ticket")
 public class Ticket {
 
+    private Set<Category> Categories;
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
     private String problem;
     private String desc;
-    private String priority;
+    // private String priority;
 
     private TicketPriority priority;
     private TicketStatus status;
@@ -94,11 +94,11 @@ public class Ticket {
     }
 
     public Set<Category> getCategories() {
-        return categories;
+        return Categories;
     }
 
     public void setCategories(Set<Category> categories) {
-        this.categories = categories;
+        Categories = categories;
     }
 
     @ManyToMany
