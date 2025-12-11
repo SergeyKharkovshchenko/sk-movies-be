@@ -1,0 +1,198 @@
+
+package com.moviesApp.service;
+
+import jakarta.persistence.EntityNotFoundException;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import com.moviesApp.common.CategoryDto;
+import com.moviesApp.common.TicketDto;
+import com.moviesApp.entities.Category;
+import com.moviesApp.entities.Comment;
+import com.moviesApp.entities.Summary;
+import com.moviesApp.entities.Ticket;
+import com.moviesApp.entities.User;
+import com.moviesApp.model.CategoryStatus;
+import com.moviesApp.model.TicketStatus;
+import com.moviesApp.model.TicketsPerPriority.Priority;
+import com.moviesApp.repositories.CategoryRepo;
+import com.moviesApp.repositories.CommentRepo;
+import com.moviesApp.repositories.TicketDeo;
+import com.moviesApp.repositories.UserRepository;
+
+import java.util.HashSet;
+
+import java.util.EnumMap;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.StreamSupport;
+import java.util.Set;
+
+@Service
+public class TicketService {
+
+    @Autowired
+    private TicketDeo ticketDeo;
+
+    @Autowired
+    private UserRepository userDeo;
+    @Autowired
+    private CommentRepo commentRepo;
+
+    @Autowired
+    private CategoryRepo categoryRepo;
+
+    public Ticket createNewTicket(TicketDto ticket) {
+        Ticket newTicket = new Ticket();
+        newTicket.setProblem(ticket.getProblem());
+        newTicket.setCreatedBy(ticket.getCreatedBy());
+        newTicket.setDesc(ticket.getDesc());
+        newTicket.setStatus(ticket.getStatus());
+        newTicket.setPriority(ticket.getPriority());
+        newTicket.setAssignedTo(ticket.getAssignedTo());
+
+        Set<Category> validatedCategories = new HashSet<>();
+        for (CategoryDto category : ticket.getCategories()) {
+            Category found = categoryRepo.findByName(category.getCategoryName().name());
+            validatedCategories.add(found);
+        }
+        newTicket.setCategories(validatedCategories);
+
+        return ticketDeo.save(newTicket);
+    }
+
+    public Ticket updateExistingTicket(Ticket request) {
+        Optional<Ticket> existingProduct = ticketDeo.findById(request.getId());
+        if (existingProduct.isPresent()) {
+            Ticket ticket = existingProduct.get();
+            ticket.setProblem(request.getProblem());
+            ticket.setCreatedBy(request.getCreatedBy());
+            ticket.setDesc(request.getDesc());
+            ticket.setStatus(request.getStatus());
+            ticket.setPriority(request.getPriority());
+            ticket.setAssignedTo(request.getAssignedTo());
+            ticket.setCategories(ticket.getCategories());
+            return ticketDeo.save(ticket);
+        }
+        return null;
+    }
+
+    public Iterable<Ticket> getAllTickets() {
+        return ticketDeo.findAll();
+    }
+
+    public Ticket getTicket(Ticket getRequests) {
+        Optional<Ticket> getTicketById = ticketDeo.findById(getRequests.getId());
+        if (getTicketById.isPresent()) {
+            Ticket ticket = getTicketById.get();
+            return ticket;
+        }
+        return null;
+    }
+
+    public Summary getticketsPerPriority() {
+
+        Iterable<Ticket> tickets = ticketDeo.findAll();
+
+        long total = StreamSupport.stream(tickets.spliterator(), false)
+                .count();
+
+        long open = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("OPEN"))
+                .count();
+
+        long closed = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getStatus().toString().equals("CLOSED"))
+                .count();
+
+        long high = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("HIGH"))
+                .count();
+
+        long medium = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("MEDIUM"))
+                .count();
+
+        long low = StreamSupport.stream(tickets.spliterator(), false)
+                .filter(t -> t.getPriority().toString().equals("LOW"))
+                .count();
+
+        EnumMap<Priority, Long> ticketsPerPriority = new EnumMap<>(Priority.class);
+        ticketsPerPriority.put(Priority.HIGH, high);
+        ticketsPerPriority.put(Priority.MEDIUM, medium);
+        ticketsPerPriority.put(Priority.LOW, low);
+
+        Summary newSummary = new Summary();
+        newSummary.setTotalTickets(total);
+        newSummary.setOpenTickets(open);
+        newSummary.setClosedTickets(closed);
+        newSummary.setTicketsPerPriority(ticketsPerPriority);
+
+        return newSummary;
+    }
+
+    public boolean deleteTicket(Ticket getRequests) {
+        Optional<Ticket> deleteTicketById = ticketDeo.findById(getRequests.getId());
+        if (deleteTicketById.isPresent()) {
+            ticketDeo.deleteById(getRequests.getId());
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public void deleteAllTickets() {
+        ticketDeo.deleteAll();
+    }
+
+
+    public void deleteAllCategories() {
+        categoryRepo.deleteAll();
+    }
+
+    public List<Ticket> searchTickets(TicketStatus status, String keyword) {
+        return ticketDeo.findAllByStatusAndProblem(status, keyword);
+
+    }
+
+    public Comment createComment(Long ticketId, Comment comment) {
+        Comment newComment = new Comment();
+        Optional<Ticket> existingTicket = ticketDeo.findById(ticketId);
+
+        if (existingTicket.isPresent()) {
+            newComment.setContent(comment.getContent());
+            newComment.setCreatedAt(new Date());
+            newComment.setTicket(existingTicket.get());
+        }
+        return commentRepo.save(newComment);
+    }
+
+    public List<Comment> getCommentById(Long ticketId) {
+        return commentRepo.findByTicketId(ticketId);
+    }
+
+    public Comment updateExistingComment(Long commentId, Comment updatedComment) {
+        Optional<Comment> existingComment = commentRepo.findById(commentId);
+
+        if (existingComment.isPresent()) {
+            Comment comment = existingComment.get();
+            comment.setContent(updatedComment.getContent());
+            return commentRepo.save(comment);
+        } else {
+            throw new EntityNotFoundException("Comment not found with ID: " + commentId);
+        }
+    }
+
+    public boolean deleteComment(Long commentId) {
+        Optional<Comment> deleteComment = commentRepo.findById(commentId);
+        if (deleteComment.isPresent()) {
+            commentRepo.deleteById(commentId);
+            return true;
+        } else {
+            return false;
+        }
+
+    }
+}
