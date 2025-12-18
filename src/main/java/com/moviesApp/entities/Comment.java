@@ -1,32 +1,26 @@
 package com.moviesApp.entities;
 
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
 
-import jakarta.persistence.*;
-
-import javax.validation.constraints.NotNull;
 import java.util.Date;
 
-@Entity
-@Table(name = "comment")
-
-
+@Document(collection = "comments")
 public class Comment {
+
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @NotNull(message = "Comment ID must not be null")
-    public Long commentId;
+    public String commentId;
+
     private String content;
     private Date createdAt;
+    private Movie movie;
+    private String userId;
 
-    @ManyToOne
-    @JoinColumn(name = "ticket_id")
-    private Ticket ticket;
-
-    public Long getCommentId() {
+    public String getCommentId() {
         return commentId;
     }
 
-    public void setCommentId(Long commentId) {
+    public void setCommentId(String commentId) {
         this.commentId = commentId;
     }
 
@@ -46,11 +40,20 @@ public class Comment {
         this.createdAt = createdAt;
     }
 
-    public Ticket getTicket() {
-        return ticket;
+    public Movie getMovie() {
+        return movie;
     }
 
-    public void setTicket(Ticket ticket) {
-        this.ticket = ticket;
+    public void setMovie(Movie movie) {
+        this.movie = movie;
     }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
 }

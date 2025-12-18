@@ -8,4 +8,3 @@ import com.moviesApp.entities.User;
 @Repository
 public interface UserRepository extends MongoRepository<User, String> {
 }
-

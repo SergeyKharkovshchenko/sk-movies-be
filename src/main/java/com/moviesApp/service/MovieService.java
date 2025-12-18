@@ -1,73 +1,122 @@
-
 package com.moviesApp.service;
 
+import com.moviesApp.common.CommentWithUserDto;
+import com.moviesApp.entities.Comment;
+import com.moviesApp.entities.Movie;
+import com.moviesApp.repositories.CommentRepo;
+import org.neo4j.driver.types.Node;
 import org.springframework.stereotype.Service;
 
-import com.moviesApp.entities.Movie;
-
+import java.util.Date;
 import java.util.List;
-
-import org.neo4j.driver.*;
-import org.neo4j.driver.Record;
-import org.neo4j.driver.types.Node;
+import java.util.Map;
 
 @Service
 public class MovieService {
 
-    public Iterable<String> getMoviesByActor() {
+    private final CommentRepo commentRepo;
+    private final UserService userService;
+    private final Neo4jService neo4j;
 
-        final String dbUri = "neo4j+s://270cf0e6.databases.neo4j.io";
-        final String dbUser = "neo4j";
-        final String dbPassword = "Aa4Zezsc_85f4Xu8i4pCu4p9S0Izr6ju2Pn9oJIEuXM";
-        String query = "MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie) RETURN m.title LIMIT 5";
-
-        try (Driver driver = GraphDatabase.driver(dbUri, AuthTokens.basic(dbUser, dbPassword));
-                Session session = driver.session()) {
-
-            Result result = session.run(query);
-            return result.list(r -> r.get("m.title").asString());
-        } catch (Exception e) {
-            System.err.println("Error executing query: " + e.getMessage());
-        }
-        return null;
+    public MovieService(CommentRepo commentRepo, UserService userService, Neo4jService neo4j) {
+        this.commentRepo = commentRepo;
+        this.userService = userService;
+        this.neo4j = neo4j;
     }
 
-    public List<Movie> getMoviesByActor2() {
+    public Iterable<String> getMoviesNamesByActor() {
+        String query = """
+                    MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie)
+                    RETURN m.title
+                    LIMIT 5
+                """;
 
-        final String dbUri = "neo4j+s://270cf0e6.databases.neo4j.io";
-        final String dbUser = "neo4j";
-        final String dbPassword = "Aa4Zezsc_85f4Xu8i4pCu4p9S0Izr6ju2Pn9oJIEuXM";
-        String query = "MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie) RETURN m LIMIT 5";
-
-        try (Driver driver = GraphDatabase.driver(dbUri, AuthTokens.basic(dbUser, dbPassword));
-                Session session = driver.session()) {
-
-            Result result = session.run(query);
-          
-            // while (result.hasNext()) {
-            // Record record = result.next();
-            // Node movie = record.get("m").asNode();
-            // movie.asMap().forEach((key, value) -> System.out.println(" " + key + " = " +
-            // value));
-            // System.out.println("-----");
-            // }
-
-            return result.list(r -> {
-                Node movieNode = r.get("m").asNode();
-                Movie movie = new Movie();
-                movie.setId(movieNode.id());
-                movie.setTitle(movieNode.get("title").asString());
-                movie.setTagline(movieNode.get("tagline").asString());
-                movie.setReleaseDate(movieNode.get("released").asInt());
-                System.out.println(movie);
-                return movie;
-            });
-
-  
-        } catch (Exception e) {
-            System.err.println("Error executing query: " + e.getMessage());
-        }
-        return null;
+        return neo4j.queryList(
+                query,
+                Map.of(),
+                r -> r.get("m.title").asString());
     }
 
+    public List<Movie> getMoviesByActor() {
+        String query = """
+                    MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie)
+                    RETURN m
+                    LIMIT 5
+                """;
+
+        return neo4j.queryList(
+                query,
+                Map.of(),
+                r -> {
+                    Node movieNode = r.get("m").asNode();
+                    Movie movie = new Movie();
+                    movie.setId(movieNode.id());
+                    movie.setTitle(movieNode.get("title").asString());
+                    movie.setTagline(movieNode.get("tagline").asString(null));
+                    movie.setReleaseDate(movieNode.get("released").asInt());
+                    return movie;
+                });
+    }
+
+    public Movie findMovieById(Long movieId) {
+        String query = """
+                    MATCH (m:Movie)
+                    WHERE id(m) = $movieId
+                    RETURN m
+                """;
+
+        return neo4j.querySingle(
+                query,
+                Map.of("movieId", movieId),
+                r -> {
+                    Node movieNode = r.get("m").asNode();
+                    Movie movie = new Movie();
+                    movie.setId(movieNode.id());
+                    movie.setTitle(movieNode.get("title").asString());
+                    movie.setTagline(movieNode.get("tagline").asString(null));
+                    movie.setReleaseDate(movieNode.get("released").asInt());
+                    return movie;
+                });
+    }
+
+    public List<CommentWithUserDto> getCommentsByMovieId(Long movieId) {
+        // 1. check that movie exists
+        String checkQuery = """
+                    MATCH (m:Movie)
+                    WHERE id(m) = $movieId
+                    RETURN m
+                    LIMIT 1
+                """;
+
+        boolean exists = neo4j.exists(checkQuery, Map.of("movieId", movieId));
+        if (!exists) {
+            return List.of();
+        }
+
+        // 2. Comments from Mongo
+        List<Comment> comments = commentRepo.findByMovieId(movieId);
+
+        // 3. DTO with username
+        return comments.stream()
+                .map(comment -> {
+                    String username = userService.findUsernameById(comment.getUserId());
+                    return new CommentWithUserDto(comment, username);
+                })
+                .toList();
+    }
+
+    public Comment createComment(Long movieId, Comment comment) {
+        Movie existingMovie = findMovieById(movieId);
+        if (existingMovie == null) {
+            throw new IllegalArgumentException("Movie with id " + movieId + " not found");
+        }
+
+        Comment newComment = new Comment();
+        newComment.setContent(comment.getContent());
+        newComment.setCreatedAt(new Date());
+        newComment.setMovie(existingMovie);
+        newComment.setUserId(comment.getUserId());
+
+        return commentRepo.save(newComment);
+    }
 }

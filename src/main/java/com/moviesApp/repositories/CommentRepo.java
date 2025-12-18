@@ -1,13 +1,15 @@
 package com.moviesApp.repositories;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
 
-import com.moviesApp.entities.Comment;
+import org.springframework.stereotype.Repository;
 
 import java.util.List;
 
+import org.springframework.data.mongodb.repository.MongoRepository;
+
+import com.moviesApp.entities.Comment;
 
 @Repository
-public interface CommentRepo extends JpaRepository<Comment, Long> {
-    List<Comment> findByTicketId(Long ticketId);
+public interface CommentRepo extends MongoRepository<Comment, String> {
+    // parses to internal command db.comments.find({ "movieId": 123 })
+    List<Comment> findByMovieId(Long movieId);
 }

@@ -2,13 +2,12 @@ package com.moviesApp.entities;
 
 import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.mapping.Document;
-// import org.bson.types.ObjectId;
 
 @Document(collection = "users")
 public class User {
 
     @Id
-    private String id; // or ObjectId String id;
+    private String id; 
 
     private String username;
 
@@ -27,4 +26,5 @@ public class User {
     public void setUsername(String user) {
         this.username = user;
     }
+
 }
