@@ -1,32 +1,10 @@
-# flyctl launch added from .gitignore
-**\HELP.md
-**\target
-!**\.mvn\wrapper\maven-wrapper.jar
-!**\**\src\main\**\target
-!**\**\src\test\**\target
-
-### STS ###
-**\.apt_generated
-**\.classpath
-**\.factorypath
-**\.project
-**\.settings
-**\.springBeans
-**\.sts4-cache
-
-
-### NetBeans ###
-nbproject\private
-nbbuild
-dist
-nbdist
-.nb-gradle
-**\build
-!**\**\src\main\**\build
-!**\**\src\test\**\build
-
-### VS Code ###
-**\.vscode
-
-**\.env
-fly.toml
+# Игнорируем всё лишнее для быстрого build
+target/
+.git/
+.idea/
+*.log
+README.md
+!.mvn/
+!.mvn/wrapper/
+mvnw
+mvnw.cmd
