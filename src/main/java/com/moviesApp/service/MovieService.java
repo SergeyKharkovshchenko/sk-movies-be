@@ -38,8 +38,8 @@ public class MovieService {
     }
 
     public List<Movie> getMoviesByActor(String actor) {
-        String actorName = actor.replace('_',' ');      
-        String query = "MATCH (p:Person {name: '"+ actorName + "'} )-[:ACTED_IN]->(m:Movie) RETURN m LIMIT 20";
+        String actorName = actor.replace('_', ' ');
+        String query = "MATCH (p:Person {name: '" + actorName + "'} )-[:ACTED_IN]->(m:Movie) RETURN m LIMIT 20";
 
         return neo4j.queryList(
                 query,
@@ -78,12 +78,7 @@ public class MovieService {
 
     public List<CommentWithUserDto> getCommentsByMovieId(Long movieId) {
         // 1. check that movie exists
-        String checkQuery = """
-                    MATCH (m:Movie)
-                    WHERE id(m) = $movieId
-                    RETURN m
-                    LIMIT 1
-                """;
+        String checkQuery = "MATCH (m:Movie) WHERE id(m) = " + movieId + " RETURN m LIMIT 1";
 
         boolean exists = neo4j.exists(checkQuery, Map.of("movieId", movieId));
         if (!exists) {
@@ -116,4 +111,23 @@ public class MovieService {
 
         return commentRepo.save(newComment);
     }
+
+    public List<Movie> findTopNewMovies(Number qty) {
+        String query = "MATCH (m:Movie) RETURN m.title, m.released ORDER BY m.released DESC LIMIT " + qty.toString();
+
+        return neo4j.queryList(
+                query,
+                Map.of(),
+                r -> {
+                    Node movieNode = r.get("m").asNode();
+                    Movie movie = new Movie();
+                    movie.setId(movieNode.id());
+                    movie.setTitle(movieNode.get("title").asString());
+                    movie.setTagline(movieNode.get("tagline").asString(null));
+                    movie.setReleaseDate(movieNode.get("released").asInt());
+                    return movie;
+                });
+
+    }
+
 }
