@@ -37,9 +37,10 @@ public class MovieService {
                 r -> r.get("m.title").asString());
     }
 
-    public List<Movie> getMoviesByActor() {
+    public List<Movie> getMoviesByActor(String actor) {
+        String actorName = actor.replace('_',' ');      
         String query = """
-                    MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie)
+                    MATCH (p:Person {name: $actorName})-[:ACTED_IN]->(m:Movie)
                     RETURN m
                     LIMIT 5
                 """;
