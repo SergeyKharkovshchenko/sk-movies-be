@@ -39,11 +39,7 @@ public class MovieService {
 
     public List<Movie> getMoviesByActor(String actor) {
         String actorName = actor.replace('_',' ');      
-        String query = """
-                    MATCH (p:Person {name: $actorName})-[:ACTED_IN]->(m:Movie)
-                    RETURN m
-                    LIMIT 5
-                """;
+        String query = "MATCH (p:Person {name: "+ actorName + "} )-[:ACTED_IN]->(m:Movie) RETURN m LIMIT 20";
 
         return neo4j.queryList(
                 query,
