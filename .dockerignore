@@ -1,4 +1,4 @@
-# Игнорируем всё лишнее для быстрого build
+# ignore for faster build
 target/
 .git/
 .idea/

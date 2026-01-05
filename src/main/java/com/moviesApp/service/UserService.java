@@ -1,9 +1,17 @@
 package com.moviesApp.service;
 
-import org.springframework.stereotype.Service;
-import com.moviesApp.entities.User;
-import com.moviesApp.repositories.UserRepository;
+import java.util.List;
 
+import org.springframework.stereotype.Service;
+
+import com.moviesApp.common.CommentWithMovieDto;
+
+import com.moviesApp.entities.Movie;
+import com.moviesApp.entities.User;
+import com.moviesApp.entities.Comment;
+
+import com.moviesApp.repositories.CommentRepo;
+import com.moviesApp.repositories.UserRepository;
 
 @Service
 public class UserService {
@@ -30,4 +38,5 @@ public class UserService {
                 .map(User::getUsername)
                 .orElse("Unknown");
     }
+
 }

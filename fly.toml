@@ -2,7 +2,7 @@ app = "sk-movies-be"
 primary_region = "fra"
 
 [build]
-  dockerfile = "Dockerfile"  # ✅ ТОЛЬКО Dockerfile!
+  dockerfile = "Dockerfile"  # ✅ only Dockerfile!
 
 [http_service]
   internal_port = 8080

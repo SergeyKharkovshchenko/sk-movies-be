@@ -22,11 +22,10 @@ public class MovieController {
     }
 
     @GetMapping("/getMoviesByActor")
-public ResponseEntity<Iterable<Movie>> getMoviesByActor(
-        @RequestParam("actor") String actorName
-) {
-    Iterable<Movie> movies = movieService.getMoviesByActor(actorName);
-    return ResponseEntity.ok(movies);
-}
+    public ResponseEntity<Iterable<Movie>> getMoviesByActor(
+            @RequestParam("actor") String actorName) {
+        Iterable<Movie> movies = movieService.getMoviesByActor(actorName);
+        return ResponseEntity.ok(movies);
+    }
 
 }
