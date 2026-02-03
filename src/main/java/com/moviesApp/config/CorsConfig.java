@@ -11,12 +11,10 @@ public class CorsConfig implements WebMvcConfigurer {
     public void addCorsMappings(CorsRegistry registry) {
         registry.addMapping("/**")
                 .allowedOrigins(
-                    "http://localhost:5173",     
-                    "https://sk-movies-fe.vercel.app"  // prod (замени)
-                )
+                        "http://localhost:5173",
+                        "https://sk-movies-fe.vercel.app")
                 .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
                 .allowCredentials(true);
     }
 }
-

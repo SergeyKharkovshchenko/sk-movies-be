@@ -3,7 +3,6 @@ package com.moviesApp.controllers;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.moviesApp.entities.Movie;
@@ -15,16 +14,9 @@ public class MovieController {
     @Autowired
     private MovieService movieService;
 
-    @GetMapping("/getMoviesNamesByActor")
-    public ResponseEntity<Iterable<String>> getMoviesNamesByActor() {
-        Iterable<String> movies = movieService.getMoviesNamesByActor();
-        return ResponseEntity.ok(movies);
-    }
-
-    @GetMapping("/getMoviesByActor")
-    public ResponseEntity<Iterable<Movie>> getMoviesByActor(
-            @RequestParam("actor") String actorName) {
-        Iterable<Movie> movies = movieService.getMoviesByActor(actorName);
+    @GetMapping("/getAllMovies")
+    public ResponseEntity<Iterable<Movie>> getAllMovies() {
+        Iterable<Movie> movies = movieService.getAllMovies();
         return ResponseEntity.ok(movies);
     }
 

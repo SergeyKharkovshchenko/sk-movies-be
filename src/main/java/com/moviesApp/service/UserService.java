@@ -1,42 +1,41 @@
 package com.moviesApp.service;
 
 import java.util.List;
+import java.util.Map;
+
+import org.neo4j.driver.types.Node;
 
 import org.springframework.stereotype.Service;
 
-import com.moviesApp.common.CommentWithMovieDto;
-
-import com.moviesApp.entities.Movie;
 import com.moviesApp.entities.User;
-import com.moviesApp.entities.Comment;
-
-import com.moviesApp.repositories.CommentRepo;
-import com.moviesApp.repositories.UserRepository;
 
 @Service
 public class UserService {
 
-    private UserRepository userRepository;
+    private final Neo4jService neo4j;
 
-    public UserService(UserRepository userRepository) {
-        this.userRepository = userRepository;
+    public UserService(Neo4jService neo4j) {
+        this.neo4j = neo4j;
     }
 
-    public User createNewUser(User user) {
-        User newUser = new User();
-        newUser.setId(user.getId());
-        newUser.setUsername(user.getUsername());
-        return userRepository.save(newUser);
-    }
+    public List<User> getAllUsers() {
+        String query = "MATCH (u:User)<-[r:`USERS_NEO4J.CSV`]-(:Review) " +
+                "WITH u, count(r) AS numReviews " +
+                "ORDER BY numReviews DESC " +
+                "RETURN u, numReviews " +
+                "LIMIT 20";
 
-    public Iterable<User> getAllUsers() {
-        return userRepository.findAll();
-    }
-
-    public String findUsernameById(String userId) {
-        return userRepository.findById(userId)
-                .map(User::getUsername)
-                .orElse("Unknown");
+        return neo4j.queryList(
+                query,
+                Map.of(),
+                r -> {
+                    Node userNode = r.get("u").asNode();
+                    User user = new User();
+                    user.setId(userNode.get("id").asString());
+                    user.setUserId(userNode.get("userId").asString());
+                    user.setNumberOfReviews(r.get("numReviews").asNumber());
+                    return user;
+                });
     }
 
 }

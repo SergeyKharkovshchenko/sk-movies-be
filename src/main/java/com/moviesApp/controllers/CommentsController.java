@@ -1,32 +1,36 @@
 package com.moviesApp.controllers;
 
-import java.util.List;
-
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.moviesApp.common.CommentWithUserDto;
+import org.springframework.beans.factory.annotation.Autowired;
 import com.moviesApp.entities.Comment;
-import com.moviesApp.service.MovieService;
+import com.moviesApp.service.CommentsService;
 
 @RestController
 public class CommentsController {
 
     @Autowired
-    private MovieService movieService;
+    private CommentsService commentsService;
 
-    @PostMapping("/{movieId}/comments")
-    public Comment createComment(@PathVariable("movieId") Long id, @RequestBody Comment comment) {
-        return movieService.createComment(id, comment);
+    @GetMapping("/getAllComments")
+    public ResponseEntity<Iterable<Comment>> getAllUsers() {
+        Iterable<Comment> users = commentsService.getAllComments();
+        return ResponseEntity.ok(users);
     }
 
-    @GetMapping("/{movieId}/comments")
-    public List<CommentWithUserDto> createComment2(@PathVariable("movieId") Long id) {
-        return movieService.getCommentsByMovieId(id);
+    @GetMapping("/comments/movie/{movieId}")
+    public ResponseEntity<Iterable<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
+        Iterable<Comment> comments = commentsService.getCommentsByMovieId(movieId);
+        return ResponseEntity.ok(comments);
+    }
+
+    @GetMapping("/comments/user/{userId}")
+    public ResponseEntity<Iterable<Comment>> getCommentsByUserId(@PathVariable String userId) {
+        Iterable<Comment> comments = commentsService.getCommentsByUserId(userId);
+        return ResponseEntity.ok(comments);
     }
 
 }

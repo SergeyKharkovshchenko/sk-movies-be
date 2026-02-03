@@ -5,41 +5,86 @@ import org.springframework.data.mongodb.core.mapping.Document;
 @Document(collection = "movies")
 public class Movie {
 
-    private Long id;
-    private String title;
-    private String tagline;
-    private Integer released;
+    private String id;
+    private String duration;
+    private String genre0;
+    private String genre1;
+    private String genre2;
+    private String movieId;
+    private String movieTitle;
+    private String plotSummary;
+    private Number averageRating;
 
-    public Long getId() {
+    public String getId() {
         return id;
     }
 
-    public void setId(Long id) {
+    public void setId(String id) {
         this.id = id;
     }
 
-    public String getTitle() {
-        return title;
+    public Number getAverageRating() {
+        return averageRating;
     }
 
-    public void setTitle(String title) {
-        this.title = title;
+    public void setAverageRating(Number averageRating) {
+        this.averageRating = averageRating;
     }
 
-    public String getTagline() {
-        return tagline;
+    public String getDuration() {
+        return duration;
     }
 
-    public void setTagline(String tagline) {
-        this.tagline = tagline;
+    public void setDuration(String duration) {
+        this.duration = duration;
     }
 
-    public Integer getReleaseDate() {
-        return released;
+    public String getGenre0() {
+        return genre0;
     }
 
-    public void setReleaseDate(Integer released) {
-        this.released = released;
+    public void setGenre0(String genre0) {
+        this.genre0 = genre0;
+    }
+
+    public String getGenre1() {
+        return genre1;
+    }
+
+    public void setGenre1(String genre1) {
+        this.genre1 = genre1;
+    }
+
+    public String getGenre2() {
+        return genre2;
+    }
+
+    public void setGenre2(String genre2) {
+        this.genre2 = genre2;
+    }
+
+    public String getMovieId() {
+        return movieId;
+    }
+
+    public void setMovieId(String movieId) {
+        this.movieId = movieId;
+    }
+
+    public String getMovieTitle() {
+        return movieTitle;
+    }
+
+    public void setMovieTitle(String movieTitle) {
+        this.movieTitle = movieTitle;
+    }
+
+    public String getPlotSummary() {
+        return plotSummary;
+    }
+
+    public void setPlotSummary(String plotSummary) {
+        this.plotSummary = plotSummary;
     }
 
 }

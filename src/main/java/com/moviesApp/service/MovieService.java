@@ -1,9 +1,6 @@
 package com.moviesApp.service;
 
-import com.moviesApp.common.CommentWithUserDto;
-import com.moviesApp.entities.Comment;
 import com.moviesApp.entities.Movie;
-import com.moviesApp.repositories.CommentRepo;
 import org.neo4j.driver.types.Node;
 import org.springframework.stereotype.Service;
 
@@ -14,122 +11,49 @@ import java.util.Map;
 @Service
 public class MovieService {
 
-    private final CommentRepo commentRepo;
-    private final UserService userService;
     private final Neo4jService neo4j;
 
-    public MovieService(CommentRepo commentRepo, UserService userService, Neo4jService neo4j) {
-        this.commentRepo = commentRepo;
-        this.userService = userService;
+    public MovieService(Neo4jService neo4j) {
         this.neo4j = neo4j;
     }
 
-    public Iterable<String> getMoviesNamesByActor() {
-        String query = """
-                    MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie)
-                    RETURN m.title
-                    LIMIT 5
-                """;
+    public List<Movie> getAllMovies() {
 
-        return neo4j.queryList(
-                query,
-                Map.of(),
-                r -> r.get("m.title").asString());
-    }
-
-    public List<Movie> getMoviesByActor(String actor) {
-        String actorName = actor.replace('_', ' ');
-        String query = "MATCH (p:Person {name: '" + actorName + "'} )-[:ACTED_IN]->(m:Movie) RETURN m LIMIT 20";
+        String query = "MATCH (m:Movie)<-[:REVIEWED_FROM_CSV]-(u:UserReview) " +
+                "WHERE u.rating IS NOT NULL " +
+                "WITH DISTINCT m " +
+                "MATCH (m:Movie)-[MOVIES]->(mg:MovieGenre)-[GENRES]->(g:Genre) " +
+                "WITH m, collect(g) AS genres " +
+                "MATCH (m:Movie)<-[:MOVIES]-(r:Review)" +
+                "WITH avg(r.rating) AS averageRating, m, genres " +
+                "RETURN m, genres[0] AS g0, genres[1] AS g1, genres[2] AS g2, averageRating " +
+                "LIMIT 20";
 
         return neo4j.queryList(
                 query,
                 Map.of(),
                 r -> {
                     Node movieNode = r.get("m").asNode();
+                    Node genre0 = r.get("g0").isNull() ? null : r.get("g0").asNode();
+                    Node genre1 = r.get("g1").isNull() ? null : r.get("g1").asNode();
+                    Node genre2 = r.get("g2").isNull() ? null : r.get("g2").asNode();
+                    Number avRating = r.get("averageRating").asNumber();
                     Movie movie = new Movie();
-                    movie.setId(movieNode.id());
-                    movie.setTitle(movieNode.get("title").asString());
-                    movie.setTagline(movieNode.get("tagline").asString(null));
-                    movie.setReleaseDate(movieNode.get("released").asInt());
+                    movie.setId(movieNode.get("id").asString());
+                    movie.setDuration(movieNode.get("duration").asString());
+                    movie.setGenre0(genre0.get("genreName").asString());
+                    if (genre1 != null) {
+                        movie.setGenre1(genre1.get("genreName").asString());
+                    }
+                    if (genre2 != null) {
+                        movie.setGenre1(genre2.get("genreName").asString());
+                    }
+                    movie.setMovieId(movieNode.get("movieId").asString());
+                    movie.setMovieTitle(movieNode.get("movieTitle").asString());
+                    movie.setPlotSummary(movieNode.get("plotSummary").asString());
+                    movie.setAverageRating(avRating);
                     return movie;
                 });
     }
-
-    public Movie findMovieById(Long movieId) {
-        String query = """
-                    MATCH (m:Movie)
-                    WHERE id(m) = $movieId
-                    RETURN m
-                """;
-
-        return neo4j.querySingle(
-                query,
-                Map.of("movieId", movieId),
-                r -> {
-                    Node movieNode = r.get("m").asNode();
-                    Movie movie = new Movie();
-                    movie.setId(movieNode.id());
-                    movie.setTitle(movieNode.get("title").asString());
-                    movie.setTagline(movieNode.get("tagline").asString(null));
-                    movie.setReleaseDate(movieNode.get("released").asInt());
-                    return movie;
-                });
-    }
-
-    public List<CommentWithUserDto> getCommentsByMovieId(Long movieId) {
-        // 1. check that movie exists
-        String checkQuery = "MATCH (m:Movie) WHERE id(m) = " + movieId + " RETURN m LIMIT 1";
-
-        boolean exists = neo4j.exists(checkQuery, Map.of("movieId", movieId));
-        if (!exists) {
-            return List.of();
-        }
-
-        // 2. Comments from Mongo
-        List<Comment> comments = commentRepo.findByMovieId(movieId);
-
-        // 3. DTO with username
-        return comments.stream()
-                .map(comment -> {
-                    String username = userService.findUsernameById(comment.getUserId());
-                    return new CommentWithUserDto(comment, username);
-                })
-                .toList();
-    }
-
-    public Comment createComment(Long movieId, Comment comment) {
-        Movie existingMovie = findMovieById(movieId);
-        if (existingMovie == null) {
-            throw new IllegalArgumentException("Movie with id " + movieId + " not found");
-        }
-
-        Comment newComment = new Comment();
-        newComment.setContent(comment.getContent());
-        newComment.setCreatedAt(new Date());
-        newComment.setMovie(existingMovie);
-        newComment.setUserId(comment.getUserId());
-
-        return commentRepo.save(newComment);
-    }
-
-    public List<Movie> findTopNewMovies(Number qty) {
-        String query = "MATCH (m:Movie) RETURN m.title, m.released ORDER BY m.released DESC LIMIT " + qty.toString();
-
-        return neo4j.queryList(
-                query,
-                Map.of(),
-                r -> {
-                    Node movieNode = r.get("m").asNode();
-                    Movie movie = new Movie();
-                    movie.setId(movieNode.id());
-                    movie.setTitle(movieNode.get("title").asString());
-                    movie.setTagline(movieNode.get("tagline").asString(null));
-                    movie.setReleaseDate(movieNode.get("released").asInt());
-                    return movie;
-                });
-
-    }
-
-    
 
 }

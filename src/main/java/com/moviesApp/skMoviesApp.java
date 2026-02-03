@@ -7,5 +7,6 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class skMoviesApp {
     public static void main(String[] args) {
         SpringApplication.run(skMoviesApp.class, args);
+
     }
 }

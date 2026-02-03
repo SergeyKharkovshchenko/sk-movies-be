@@ -7,9 +7,9 @@ import org.springframework.data.mongodb.core.mapping.Document;
 public class User {
 
     @Id
-    private String id; 
-
-    private String username;
+    private String id;
+    private String userId;
+    private Number numberOfReviews;
 
     public String getId() {
         return id;
@@ -19,12 +19,20 @@ public class User {
         this.id = id;
     }
 
-    public String getUsername() {
-        return username;
+    public void setNumberOfReviews(Number numberOfReviews) {
+        this.numberOfReviews = numberOfReviews;
     }
 
-    public void setUsername(String user) {
-        this.username = user;
+    public Number getNumberOfReviews() {
+        return numberOfReviews;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
     }
 
 }
