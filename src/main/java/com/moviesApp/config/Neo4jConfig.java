@@ -1,7 +1,11 @@
 package com.moviesApp.config;
 
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
+import org.neo4j.driver.Config;
 import org.neo4j.driver.GraphDatabase;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -21,6 +25,13 @@ public class Neo4jConfig {
 
     @Bean
     public Driver neo4jDriver() {
-        return GraphDatabase.driver(uri, AuthTokens.basic(user, password));
+        Config.ConfigBuilder builder = Config.builder()
+                .withConnectionAcquisitionTimeout(120, TimeUnit.SECONDS)
+                .withMaxConnectionLifetime(30, TimeUnit.MINUTES)
+                .withMaxConnectionPoolSize(50)
+                .withConnectionTimeout(30, TimeUnit.SECONDS);
+        return GraphDatabase.driver(uri, AuthTokens.basic(user, password),
+                builder.build());
     }
+
 }
