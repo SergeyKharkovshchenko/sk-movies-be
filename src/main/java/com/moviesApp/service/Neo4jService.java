@@ -25,7 +25,7 @@ public class Neo4jService {
     }
 
     public <T> T querySingle(String cypher, Map<String, Object> params, Function<Record, T> mapper) {
-        try (Session session = driver.session()) {
+        try (Session session = driver.session(SessionConfig.forDatabase("neo4j"))) {
             Result result = session.run(cypher, params);
             if (!result.hasNext()) {
                 return null;
@@ -36,10 +36,10 @@ public class Neo4jService {
     }
 
     public boolean exists(String cypher, Map<String, Object> params) {
-        try (Session session = driver.session()) {
+        try (Session session = driver.session(SessionConfig.forDatabase("neo4j"))) {
             Result result = session.run(cypher, params);
             return result.hasNext();
         }
     }
-}
 
+}

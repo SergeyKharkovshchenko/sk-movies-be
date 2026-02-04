@@ -52,7 +52,6 @@
 			<artifactId>spring-boot-starter-data-neo4j</artifactId>
 		</dependency>
 
-
 		<!-- Spring Boot Starter Web (optional, if you have REST controllers) -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>

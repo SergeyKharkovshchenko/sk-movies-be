@@ -1,6 +1,7 @@
 package com.moviesApp.controllers;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
@@ -15,18 +16,21 @@ public class CommentsController {
     @Autowired
     private CommentsService commentsService;
 
+    @CrossOrigin(origins = "*")
     @GetMapping("/getAllComments")
     public ResponseEntity<Iterable<Comment>> getAllUsers() {
         Iterable<Comment> users = commentsService.getAllComments();
         return ResponseEntity.ok(users);
     }
 
+    @CrossOrigin(origins = "*")
     @GetMapping("/comments/movie/{movieId}")
     public ResponseEntity<Iterable<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
         Iterable<Comment> comments = commentsService.getCommentsByMovieId(movieId);
         return ResponseEntity.ok(comments);
     }
 
+    @CrossOrigin(origins = "*")
     @GetMapping("/comments/user/{userId}")
     public ResponseEntity<Iterable<Comment>> getCommentsByUserId(@PathVariable String userId) {
         Iterable<Comment> comments = commentsService.getCommentsByUserId(userId);
