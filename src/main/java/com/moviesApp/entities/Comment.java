@@ -1,11 +1,10 @@
 package com.moviesApp.entities;
 
 import org.springframework.data.annotation.Id;
-import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.util.Date;
 
-@Document(collection = "comments")
+// @Document(collection = "comments")
 public class Comment {
 
     @Id
