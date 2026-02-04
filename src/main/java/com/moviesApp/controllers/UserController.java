@@ -15,7 +15,6 @@ public class UserController {
     @Autowired
     private UserService userService;
 
-    @CrossOrigin(origins = { "http://localhost:5173", "https://sk-movies-fe.vercel.app" })
     @GetMapping("/getAllUsers")
     public ResponseEntity<Iterable<User>> getAllUsers() {
         Iterable<User> users = userService.getAllUsers();
