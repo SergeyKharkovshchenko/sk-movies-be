@@ -2,9 +2,6 @@ package com.moviesApp.entities;
 
 import org.springframework.data.annotation.Id;
 
-import java.util.Date;
-
-// @Document(collection = "comments")
 public class Comment {
 
     @Id

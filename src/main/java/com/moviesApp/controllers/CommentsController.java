@@ -23,7 +23,7 @@ public class CommentsController {
         return ResponseEntity.ok(users);
     }
 
-    @CrossOrigin(origins = { "http://localhost:5173", "https://sk-movies-fe.vercel.app" })
+    // @CrossOrigin(origins = { "http://localhost:5173", "https://sk-movies-fe.vercel.app" })
     @GetMapping("/comments/movie/{movieId}")
     public ResponseEntity<Iterable<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
         Iterable<Comment> comments = commentsService.getCommentsByMovieId(movieId);
