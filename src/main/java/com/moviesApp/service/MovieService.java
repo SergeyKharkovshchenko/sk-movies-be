@@ -4,7 +4,6 @@ import com.moviesApp.entities.Movie;
 import org.neo4j.driver.types.Node;
 import org.springframework.stereotype.Service;
 
-import java.util.Date;
 import java.util.List;
 import java.util.Map;
 

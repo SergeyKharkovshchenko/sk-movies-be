@@ -15,7 +15,7 @@ public class MovieController {
     @Autowired
     private MovieService movieService;
 
-@CrossOrigin(origins = {"http://localhost:5173", "https://sk-movies-fe.vercel.app"}) 
+    @CrossOrigin(origins = { "http://localhost:5173", "https://sk-movies-fe.vercel.app" })
     @GetMapping("/getAllMovies")
     public ResponseEntity<Iterable<Movie>> getAllMovies() {
         Iterable<Movie> movies = movieService.getAllMovies();

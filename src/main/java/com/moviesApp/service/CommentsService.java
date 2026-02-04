@@ -8,7 +8,6 @@ import org.neo4j.driver.types.Node;
 import org.springframework.stereotype.Service;
 
 import com.moviesApp.entities.Comment;
-import com.moviesApp.entities.Movie;
 
 @Service
 public class CommentsService {
