@@ -58,8 +58,8 @@ public class CommentsService {
                     Node movieNode = r.get("m").asNode();
                     Comment comment = new Comment();
                     comment.setId(commentNode.get("id").asString());
-                    comment.setUserId(commentNode.get(":START_ID(User)").asString());
-                    comment.setMovieId(commentNode.get("Movie_id").asString());
+                    comment.setUserId(commentNode.get("UserId").asString());
+                    comment.setMovieId(movieNode.get("movieId").asString());
                     comment.setMovieTitle(movieNode.get("movieTitle").asString());
                     comment.setIsSpoiler(commentNode.get("isSpoiler").asBoolean());
                     comment.setRating(commentNode.get("rating").asInt());

@@ -58,6 +58,11 @@
 			<version>2.0.1.Final</version>
 		</dependency>
 
+		<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+</dependency>
+
 		<!-- Testing (optional) -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
