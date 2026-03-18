@@ -412,117 +412,110 @@ public class UserService {
                 }
         }
 
+        private List<Map<String, Object>> fetchUserTopMovies(String userId) {
+                String getMoviesQuery = """
+                                MATCH (m:Movie)<-[REVIEWED_FROM_CSV]-(rv:Review)-[r:`USERS_NEO4J.CSV`]->(u:User)
+                                WHERE u.userId = $userId
+                                RETURN u.userId AS userId,
+                                       collect(DISTINCT {movieId: m.movieId, movieTitle: m.movieTitle, rating: rv.rating})[0..9] AS topMovies
+                                """;
+                return neo4j.queryList(getMoviesQuery,
+                                Map.of("userId", userId),
+                                r -> Map.of(
+                                                "userId", r.get("userId").asString(),
+                                                "topMovies", r.get("topMovies").asList()));
+        }
+
+        private List<List<Double>> generateMovieEmbeddings(String userId, List<Map<String, Object>> topMovies)
+                        throws Exception {
+                System.out.println(
+                                "Processing user: " + userId + " with " + topMovies.size() + " movies");
+
+                String apiKey = "jina_e18883450d33421f91cf8dddbf1e8d3caglHJmF96YdIHKQ8YayusXtyfmOA";
+                HttpClient client = HttpClient.newHttpClient();
+
+                List<List<Double>> allMovieEmbeddings = new ArrayList<>();
+
+                for (Map<String, Object> movie : topMovies) {
+                        String embedText = String.format("User: %s | Movie: %s | Rating: %s",
+                                        userId, movie.get("movieTitle"), movie.get("rating"));
+
+                        Map<String, Object> payload = Map.of(
+                                        "model", "jina-embeddings-v5-text-small",
+                                        "task", "retrieval.query",
+                                        "dimensions", 1024,
+                                        "input", List.of(embedText));
+
+                        String jsonBody = new ObjectMapper().writeValueAsString(payload);
+                        HttpRequest request = HttpRequest.newBuilder()
+                                        .uri(URI.create("https://api.jina.ai/v1/embeddings"))
+                                        .header("Authorization", "Bearer " + apiKey)
+                                        .header("Content-Type", "application/json")
+                                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                                        .build();
+
+                        HttpResponse<String> response = client.send(request,
+                                        HttpResponse.BodyHandlers.ofString());
+
+                        if (response.statusCode() != 200) {
+                                throw new RuntimeException("Jina failed for " + embedText + ": "
+                                                + response.body());
+                        }
+
+                        Map<String, Object> result = new ObjectMapper().readValue(response.body(),
+                                        Map.class);
+                        @SuppressWarnings("unchecked")
+                        List<Map<String, Object>> data = (List<Map<String, Object>>) result.get("data");
+                        @SuppressWarnings("unchecked")
+                        List<Double> embedding = (List<Double>) data.get(0).get("embedding");
+
+                        allMovieEmbeddings.add(embedding);
+                        System.out.println("Got embedding for " + movie.get("movieTitle") + " dim="
+                                        + embedding.size());
+                }
+
+                return allMovieEmbeddings;
+        }
+
         public List<Map<String, Object>> createRatingsEmbeddingSafe3(String userId) throws Exception {
 
                 try {
-                        // Replace hardcoded userIds with single userId
-                        String getMoviesQuery = """
-                                        MATCH (m:Movie)<-[REVIEWED_FROM_CSV]-(rv:Review)-[r:`USERS_NEO4J.CSV`]->(u:User)
-                                        WHERE u.userId = $userId
+                        List<Map<String, Object>> movieData = fetchUserTopMovies(userId);
+                        @SuppressWarnings("unchecked")
+                        List<Map<String, Object>> topMovies = (List<Map<String, Object>>) movieData.get(0)
+                                        .get("topMovies");
+                        List<List<Double>> allMovieEmbeddings = generateMovieEmbeddings(userId, topMovies);
+
+                        List<Double> avgEmbedding = computeAverageEmbedding(allMovieEmbeddings);
+
+                        String profileCypher = """
+                                        MERGE (u:User {userId: $userId})
+                                        MERGE (u)-[:HAS_PROFILE_EMBED]->(upe:UserProfileEmbedding {userId: $userId})
+                                        SET upe.profileEmbedding = $avgEmbedding,
+                                            upe.movieCount = size($movieEmbeddings)
                                         RETURN u.userId AS userId,
-                                               collect(DISTINCT {movieId: m.movieId, movieTitle: m.movieTitle, rating: rv.rating})[0..9] AS topMovies
+                                               size(upe.profileEmbedding) AS embeddingDim,
+                                               upe.movieCount AS movieCount
                                         """;
 
-                        List<Map<String, Object>> movieData = neo4j.queryList(getMoviesQuery,
-                                        Map.of("userId", userId), // Single userId parameter
+                        Map<String, Object> profileParams = Map.of(
+                                        "userId", userId,
+                                        "avgEmbedding", avgEmbedding,
+                                        "movieEmbeddings", allMovieEmbeddings);
+
+                        List<Map<String, Object>> profileResult = neo4j.queryList(profileCypher, profileParams,
                                         r -> Map.of(
                                                         "userId", r.get("userId").asString(),
-                                                        "topMovies", r.get("topMovies").asList()));
+                                                        "embeddingDim", r.get("embeddingDim").asLong(),
+                                                        "movieCount", r.get("movieCount").asLong()));
 
-                        String apiKey = "jina_e18883450d33421f91cf8dddbf1e8d3caglHJmF96YdIHKQ8YayusXtyfmOA";
-                        HttpClient client = HttpClient.newHttpClient();
-
-                        List<Map<String, Object>> results = new ArrayList<>();
-
-                        for (Map<String, Object> userMovies : movieData) {
-                                String userIdNumber = (String) userMovies.get("userId");
-                                @SuppressWarnings("unchecked")
-                                List<Map<String, Object>> topMovies = (List<Map<String, Object>>) userMovies
-                                                .get("topMovies");
-
-                                System.out.println(
-                                                "Processing user: " + userIdNumber + " with " + topMovies.size()
-                                                                + " movies");
-
-                                // Collect ALL embeddings for this user
-                                List<List<Double>> allMovieEmbeddings = new ArrayList<>();
-
-                                for (Map<String, Object> movie : topMovies) {
-                                        String embedText = String.format("User: %s | Movie: %s | Rating: %s",
-                                                        userIdNumber, movie.get("movieTitle"), movie.get("rating"));
-
-                                        // Jina API call
-                                        Map<String, Object> payload = Map.of(
-                                                        "model", "jina-embeddings-v5-text-small",
-                                                        "task", "retrieval.query",
-                                                        "dimensions", 1024,
-                                                        "input", List.of(embedText));
-
-                                        String jsonBody = new ObjectMapper().writeValueAsString(payload);
-                                        HttpRequest request = HttpRequest.newBuilder()
-                                                        .uri(URI.create("https://api.jina.ai/v1/embeddings"))
-                                                        .header("Authorization", "Bearer " + apiKey)
-                                                        .header("Content-Type", "application/json")
-                                                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                                                        .build();
-
-                                        HttpResponse<String> response = client.send(request,
-                                                        HttpResponse.BodyHandlers.ofString());
-
-                                        if (response.statusCode() != 200) {
-                                                throw new RuntimeException("Jina failed for " + embedText + ": "
-                                                                + response.body());
-                                        }
-
-                                        Map<String, Object> result = new ObjectMapper().readValue(response.body(),
-                                                        Map.class);
-                                        @SuppressWarnings("unchecked")
-                                        List<Map<String, Object>> data = (List<Map<String, Object>>) result.get("data");
-                                        @SuppressWarnings("unchecked")
-                                        List<Double> embedding = (List<Double>) data.get(0).get("embedding");
-
-                                        allMovieEmbeddings.add(embedding);
-                                        System.out.println("Got embedding for " + movie.get("movieTitle") + " dim="
-                                                        + embedding.size());
-                                }
-
-                                // Compute average embedding (1024 dimensions)
-                                List<Double> avgEmbedding = computeAverageEmbedding(allMovieEmbeddings);
-
-                                // Create/update SINGLE user profile embedding
-                                String profileCypher = """
-                                                MERGE (u:User {userId: $userId})
-                                                MERGE (u)-[:HAS_PROFILE_EMBED]->(upe:UserProfileEmbedding {userId: $userId})
-                                                SET upe.profileEmbedding = $avgEmbedding,
-                                                    upe.movieCount = size($movieEmbeddings)
-                                                RETURN u.userId AS userId,
-                                                       size(upe.profileEmbedding) AS embeddingDim,
-                                                       upe.movieCount AS movieCount
-                                                """;
-
-                                Map<String, Object> profileParams = Map.of(
-                                                "userId", userIdNumber,
-                                                "avgEmbedding", avgEmbedding,
-                                                "movieEmbeddings", allMovieEmbeddings // For movieCount
-                                );
-
-                                List<Map<String, Object>> profileResult = neo4j.queryList(profileCypher, profileParams,
-                                                r -> Map.of(
-                                                                "userId", r.get("userId").asString(),
-                                                                "embeddingDim", r.get("embeddingDim").asLong(),
-                                                                "movieCount", r.get("movieCount").asLong()));
-
-                                System.out.println("Created profile for " + userIdNumber + ": " + profileResult);
-                                results.addAll(profileResult);
-                        }
-
-                        return results;
+                        System.out.println("Created profile for " + userId + ": " + profileResult);
+                        return profileResult;
 
                 } catch (Exception e) {
                         return List.of(Map.of(
                                         "error", "Failed: " + e.getMessage(),
-                                        "userId", userId // Pass through userId
-                        ));
+                                        "userId", userId));
                 }
         }
 
