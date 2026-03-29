@@ -88,3 +88,13 @@ JINA_API_KEY         # currently hardcoded in UserService — move to env
 Allows origins:
 - `https://*.vercel.app` (production frontend)
 - `http://localhost:*` (local dev)
+
+## Git Workflow
+
+For every task that involves code changes:
+1. Create a feature branch: `git checkout -b feature/<short-kebab-description>`
+2. Make all changes on that branch
+3. Commit the changes with a descriptive message
+4. Push the branch: `git push -u origin feature/<short-kebab-description>`
+
+Do this **before** making any file edits. Never commit directly to `main`.
