@@ -52,6 +52,34 @@ public class KnowledgeService {
         this.objectMapper = objectMapper;
     }
 
+    // ── Suggest sections ─────────────────────────────────────────────────────
+
+    private static final String SECTION_SYSTEM_PROMPT = """
+            You are a text analyst. Split the provided text into logical thematic sections.
+            Return ONLY a valid JSON array with this exact format:
+            [{"title": "Section Title", "text": "The full text of this section..."}]
+            Rules:
+            - Each section covers one coherent topic or theme
+            - Section titles are concise (2-5 words, title case)
+            - ALL original text must appear across sections — do not paraphrase or omit anything
+            - Return between 2 and 10 sections depending on text complexity
+            - No markdown, no explanation — just the JSON array
+            """;
+
+    public List<Map<String, String>> suggestSections(String text) throws Exception {
+        String response = openAi.chat(SECTION_SYSTEM_PROMPT, text).strip();
+        if (response.startsWith("```")) {
+            response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+        }
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> sections = objectMapper.readValue(response,
+                objectMapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+        return sections.stream()
+                .filter(s -> s.containsKey("title") && s.containsKey("text")
+                        && !s.get("text").isBlank())
+                .toList();
+    }
+
     // ── Process ──────────────────────────────────────────────────────────────
 
     public SseEmitter process(List<Map<String, String>> sections, String label) {

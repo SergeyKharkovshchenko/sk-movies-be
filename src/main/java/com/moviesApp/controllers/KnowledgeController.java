@@ -20,6 +20,27 @@ public class KnowledgeController {
     }
 
     /**
+     * Step 1: suggest sections from raw text (no processing, no storage).
+     * FE shows these to the user for review/edit, then calls /knowledge/process.
+     * Body: { "text": "..." }
+     * Returns: [{ "title": "Early Life", "text": "..." }, ...]
+     */
+    @PostMapping("/knowledge/suggest-sections")
+    public ResponseEntity<?> suggestSections(@RequestBody Map<String, String> body) {
+        String text = body.get("text");
+        if (text == null || text.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
+        }
+        try {
+            return ResponseEntity.ok(knowledgeService.suggestSections(text.trim()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * Step 2: process confirmed sections (after FE user review).
      * Accepts either:
      *   { "label": "napoleon", "text": "raw text..." }
      *   { "label": "napoleon", "sections": [{"title": "Career", "text": "..."}] }
