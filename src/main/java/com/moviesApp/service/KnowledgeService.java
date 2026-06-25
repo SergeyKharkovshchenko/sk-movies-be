@@ -18,6 +18,7 @@ import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 public class KnowledgeService {
@@ -78,6 +79,216 @@ public class KnowledgeService {
                 .filter(s -> s.containsKey("title") && s.containsKey("text")
                         && !s.get("text").isBlank())
                 .toList();
+    }
+
+    // ── Suggest graph ─────────────────────────────────────────────────────────
+
+    private static final String GRAPH_DESIGN_PROMPT = """
+            You are a knowledge graph designer. Analyze the text and design a structured knowledge graph.
+            Return ONLY a valid JSON object — no markdown, no explanation:
+            {
+              "entities": [
+                { "name": "Entity Name", "type": "Person|Event|Place|Organization|Concept" }
+              ],
+              "sections": [
+                {
+                  "title": "Section Title",
+                  "forEntity": "Entity Name",
+                  "sectionRelationship": "HAS_TOPIC_INFO",
+                  "text": "The exact text content of this section..."
+                }
+              ],
+              "entityRelationships": [
+                { "from": "Entity A", "predicate": "RELATIONSHIP_TYPE", "to": "Entity B" }
+              ]
+            }
+            Rules:
+            - Entity names are exact proper nouns (1-4 words)
+            - Entity type is one of: Person, Event, Place, Organization, Concept
+            - Every section is assigned to exactly one entity via forEntity
+            - sectionRelationship must follow HAS_<TOPIC>_INFO pattern in UPPERCASE_SNAKE_CASE
+              (e.g. HAS_CAREER_INFO, HAS_GENERAL_INFO, HAS_DEATH_INFO, HAS_EDUCATION_INFO)
+            - ALL original text must appear in sections — assign every sentence to exactly one section
+            - Entity relationship predicates use UPPERCASE_SNAKE_CASE
+              (e.g. RELATED_TO, PARTICIPATED_IN, LED, MARRIED_TO, ALLY_OF, ENEMY_OF)
+            - Only create entityRelationships between entities that are explicitly connected in the text
+            """;
+
+    public Map<String, Object> suggestGraph(String text) throws Exception {
+        String response = openAi.chat(GRAPH_DESIGN_PROMPT, text).strip();
+        if (response.startsWith("```")) {
+            response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = objectMapper.readValue(response, Map.class);
+        return result;
+    }
+
+    // ── Process graph (structured) ────────────────────────────────────────────
+
+    public SseEmitter processGraph(String label,
+                                   List<Map<String, String>> entities,
+                                   List<Map<String, String>> sections,
+                                   List<Map<String, String>> entityRelationships) {
+        SseEmitter emitter = new SseEmitter(300_000L);
+        executor.submit(() -> {
+            try {
+                // 1. Create entity nodes
+                try (Session session = driver.session()) {
+                    for (Map<String, String> entity : entities) {
+                        createEntityNode(entity.get("name"), entity.getOrDefault("type", "Entity"), label, session);
+                        send(emitter, "entity_stored", Map.of(
+                                "name", entity.get("name"),
+                                "type", entity.getOrDefault("type", "Entity")
+                        ));
+                    }
+                }
+
+                // 2. Per section: sub-node → relationship → chunk → extract → store → embed
+                int totalSections = sections.size();
+                Set<String> seenTripleKeys = new LinkedHashSet<>();
+                int totalTriples = 0;
+
+                for (int si = 0; si < totalSections; si++) {
+                    Map<String, String> sec = sections.get(si);
+                    String sectionTitle        = sec.getOrDefault("title", "section_" + (si + 1));
+                    String forEntity           = sec.getOrDefault("forEntity", "");
+                    String sectionRelationship = sec.getOrDefault("sectionRelationship", "HAS_INFO");
+                    String sectionText         = sec.get("text");
+
+                    send(emitter, "section_start", Map.of(
+                            "section", sectionTitle, "forEntity", forEntity,
+                            "index", si + 1, "total", totalSections
+                    ));
+
+                    // Create section sub-node + HAS_*_INFO relationship to entity
+                    try (Session session = driver.session()) {
+                        createSectionSubNode(sectionTitle, forEntity, sectionRelationship, label, session);
+                    }
+
+                    if (sectionText == null || sectionText.isBlank()) {
+                        send(emitter, "section_done", Map.of(
+                                "section", sectionTitle, "forEntity", forEntity,
+                                "index", si + 1, "total", totalSections,
+                                "triples", 0, "embedded", 0
+                        ));
+                        continue;
+                    }
+
+                    // Chunk
+                    List<String> chunks = chunk(sectionText);
+                    send(emitter, "chunk_done", Map.of("section", sectionTitle, "count", chunks.size()));
+
+                    // Extract triples
+                    List<Triple> sectionTriples = new ArrayList<>();
+                    for (int ci = 0; ci < chunks.size(); ci++) {
+                        List<Triple> triples = extractor.extract(chunks.get(ci));
+                        for (Triple t : triples) {
+                            if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
+                                sectionTriples.add(t);
+                            }
+                        }
+                        send(emitter, "extract_progress", Map.of(
+                                "section", sectionTitle,
+                                "chunk", ci + 1, "totalChunks", chunks.size(),
+                                "chunkTriples", triples.size(),
+                                "sectionTriples", sectionTriples.size()
+                        ));
+                    }
+
+                    // Store triples (nodes tagged with sectionTitle)
+                    storeGraph(sectionTriples, label, sectionTitle);
+                    totalTriples += sectionTriples.size();
+                    send(emitter, "graph_stored", Map.of(
+                            "section", sectionTitle,
+                            "triples", sectionTriples.size(),
+                            "totalTriples", totalTriples
+                    ));
+
+                    // Embed section sub-node name + unique triple node names
+                    List<String> toEmbed = Stream.concat(
+                            Stream.of(sectionTitle),
+                            uniqueNodeNames(sectionTriples).stream()
+                    ).distinct().collect(Collectors.toList());
+
+                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, toEmbed);
+                    int embedded = 0;
+                    for (int i = 0; i < toEmbed.size(); i += EMBED_BATCH) {
+                        List<String> batch = toEmbed.subList(i, Math.min(i + EMBED_BATCH, toEmbed.size()));
+                        List<float[]> vectors = jina.embed(batch);
+                        List<BikeEmbedding> embedEntities = new ArrayList<>();
+                        for (int j = 0; j < batch.size(); j++) {
+                            String name = batch.get(j);
+                            embedEntities.add(new BikeEmbedding(
+                                    SOURCE_TYPE, label + "_" + Math.abs(name.hashCode()),
+                                    name, label, name,
+                                    floatArrayToVectorString(vectors.get(j)),
+                                    "jina", vectors.get(j).length
+                            ));
+                        }
+                        repository.saveAll(embedEntities);
+                        embedded += batch.size();
+                        send(emitter, "embed_progress", Map.of(
+                                "section", sectionTitle,
+                                "embedded", embedded, "total", toEmbed.size()
+                        ));
+                    }
+
+                    send(emitter, "section_done", Map.of(
+                            "section", sectionTitle, "forEntity", forEntity,
+                            "index", si + 1, "total", totalSections,
+                            "triples", sectionTriples.size(), "embedded", toEmbed.size()
+                    ));
+                }
+
+                // 3. Entity → entity relationships
+                int relsCreated = 0;
+                try (Session session = driver.session()) {
+                    relsCreated = createEntityRelationships(entityRelationships, label, session);
+                }
+                send(emitter, "relationships_stored", Map.of("count", relsCreated));
+
+                // 4. Embed entity nodes themselves
+                List<String> entityNames = entities.stream()
+                        .map(e -> e.get("name"))
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+                if (!entityNames.isEmpty()) {
+                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, entityNames);
+                    List<float[]> vectors = jina.embed(entityNames);
+                    List<BikeEmbedding> embedEntities = new ArrayList<>();
+                    for (int i = 0; i < entityNames.size(); i++) {
+                        String name = entityNames.get(i);
+                        embedEntities.add(new BikeEmbedding(
+                                SOURCE_TYPE, label + "_" + Math.abs(name.hashCode()),
+                                name, label, name,
+                                floatArrayToVectorString(vectors.get(i)),
+                                "jina", vectors.get(i).length
+                        ));
+                    }
+                    repository.saveAll(embedEntities);
+                    send(emitter, "entities_embedded", Map.of("count", entityNames.size()));
+                }
+
+                long nodeCount = countNodes(label);
+                send(emitter, "complete", Map.of(
+                        "label", label,
+                        "nodes", nodeCount,
+                        "relationships", totalTriples + relsCreated,
+                        "sections", totalSections,
+                        "entities", entities.size()
+                ));
+                emitter.complete();
+
+            } catch (Exception e) {
+                try {
+                    send(emitter, "error", Map.of("message",
+                            e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                    emitter.completeWithError(e);
+                } catch (IOException ignored) {}
+            }
+        });
+        return emitter;
     }
 
     // ── Process ──────────────────────────────────────────────────────────────
@@ -310,6 +521,52 @@ public class KnowledgeService {
             names.add(t.object());
         }
         return new ArrayList<>(names);
+    }
+
+    private void createEntityNode(String name, String type, String label, Session session) {
+        String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
+        String safeType  = type.replaceAll("[^a-zA-Z0-9]", "_");
+        session.run(String.format(
+                "MERGE (e:KGNode:`%s`:`%s` {name: $name, sourceLabel: $label}) " +
+                "ON CREATE SET e.nodeType = 'entity'",
+                safeLabel, safeType),
+                Map.of("name", name, "label", label));
+    }
+
+    private void createSectionSubNode(String sectionTitle, String forEntity,
+                                      String sectionRelationship, String label, Session session) {
+        String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
+        String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
+        session.run(String.format(
+                "MERGE (s:KGNode:`%s`:Section {name: $title, sourceLabel: $label}) " +
+                "ON CREATE SET s.nodeType = 'section', s.forEntity = $forEntity",
+                safeLabel),
+                Map.of("title", sectionTitle, "forEntity", forEntity, "label", label));
+        session.run(String.format(
+                "MATCH (e:KGNode {name: $entity, sourceLabel: $label}) " +
+                "MATCH (s:KGNode {name: $title,  sourceLabel: $label}) " +
+                "MERGE (e)-[:`%s`]->(s)",
+                safeRel),
+                Map.of("entity", forEntity, "title", sectionTitle, "label", label));
+    }
+
+    private int createEntityRelationships(List<Map<String, String>> rels, String label, Session session) {
+        int count = 0;
+        for (Map<String, String> rel : rels) {
+            String from = rel.get("from");
+            String to   = rel.get("to");
+            String pred = rel.get("predicate");
+            if (from == null || to == null || pred == null) continue;
+            String safePred = pred.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
+            session.run(String.format(
+                    "MATCH (a:KGNode {name: $from, sourceLabel: $label}) " +
+                    "MATCH (b:KGNode {name: $to,   sourceLabel: $label}) " +
+                    "MERGE (a)-[:`%s`]->(b)",
+                    safePred),
+                    Map.of("from", from, "to", to, "label", label));
+            count++;
+        }
+        return count;
     }
 
     private long countNodes(String label) {

@@ -20,7 +20,49 @@ public class KnowledgeController {
     }
 
     /**
-     * Step 1: suggest sections from raw text (no processing, no storage).
+     * Step 1 (structured): GPT suggests entities, sections assigned to entities,
+     * and entity-to-entity relationships. FE shows for review, then calls /knowledge/process-graph.
+     * Body: { "text": "..." }
+     */
+    @PostMapping("/knowledge/suggest-graph")
+    public ResponseEntity<?> suggestGraph(@RequestBody Map<String, String> body) {
+        String text = body.get("text");
+        if (text == null || text.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
+        }
+        try {
+            return ResponseEntity.ok(knowledgeService.suggestGraph(text.trim()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * Step 2 (structured): process confirmed graph structure via SSE.
+     * SSE events: entity_stored, section_start, chunk_done, extract_progress,
+     *             graph_stored, embed_progress, section_done, relationships_stored,
+     *             entities_embedded, complete, error
+     */
+    @PostMapping(value = "/knowledge/process-graph", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter processGraph(@RequestBody Map<String, Object> body) {
+        String label = String.valueOf(body.getOrDefault("label", "default")).trim();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> entities = body.containsKey("entities")
+                ? (List<Map<String, String>>) body.get("entities") : List.of();
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> sections = body.containsKey("sections")
+                ? (List<Map<String, String>>) body.get("sections") : List.of();
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> entityRelationships = body.containsKey("entityRelationships")
+                ? (List<Map<String, String>>) body.get("entityRelationships") : List.of();
+
+        return knowledgeService.processGraph(label, entities, sections, entityRelationships);
+    }
+
+    /**
+     * Step 1 (flat): suggest sections from raw text (no processing, no storage).
      * FE shows these to the user for review/edit, then calls /knowledge/process.
      * Body: { "text": "..." }
      * Returns: [{ "title": "Early Life", "text": "..." }, ...]
