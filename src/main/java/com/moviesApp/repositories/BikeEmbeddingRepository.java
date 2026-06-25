@@ -52,6 +52,15 @@ public interface BikeEmbeddingRepository extends JpaRepository<BikeEmbedding, Lo
     @Transactional
     void deleteBySourceTypeAndLabels(String sourceType, String labels);
 
+    @Modifying
+    @Transactional
+    @Query(value = "DELETE FROM bike_embeddings WHERE source_type = :sourceType AND labels = :labels AND name IN :names",
+           nativeQuery = true)
+    void deleteBySourceTypeAndLabelsAndNameIn(
+            @Param("sourceType") String sourceType,
+            @Param("labels") String labels,
+            @Param("names") List<String> names);
+
     long countBySourceTypeAndLabels(String sourceType, String labels);
 
     @Query(value = "SELECT DISTINCT labels FROM bike_embeddings WHERE source_type = 'knowledge_node'",

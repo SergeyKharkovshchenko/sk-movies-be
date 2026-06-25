@@ -19,26 +19,45 @@ public class KnowledgeController {
         this.knowledgeService = knowledgeService;
     }
 
+    /**
+     * Accepts either:
+     *   { "label": "napoleon", "text": "raw text..." }
+     *   { "label": "napoleon", "sections": [{"title": "Career", "text": "..."}] }
+     *
+     * SSE events: section_start, chunk_done, extract_progress, graph_stored,
+     *             embed_progress, section_done, complete, error, section_skip
+     */
     @PostMapping(value = "/knowledge/process", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter process(@RequestBody Map<String, String> body) {
-        String text  = body.get("text");
-        String label = body.getOrDefault("label", "default");
-        if (text == null || text.isBlank()) {
-            SseEmitter emitter = new SseEmitter();
-            try {
-                emitter.send(SseEmitter.event().name("error").data("{\"message\":\"text is required\"}"));
-                emitter.complete();
-            } catch (Exception ignored) {}
-            return emitter;
+    public SseEmitter process(@RequestBody Map<String, Object> body) {
+        String label = String.valueOf(body.getOrDefault("label", "default")).trim();
+
+        List<Map<String, String>> sections;
+        if (body.containsKey("sections")) {
+            @SuppressWarnings("unchecked")
+            List<Map<String, String>> s = (List<Map<String, String>>) body.get("sections");
+            sections = s;
+        } else {
+            String text = (String) body.get("text");
+            if (text == null || text.isBlank()) {
+                SseEmitter emitter = new SseEmitter();
+                try {
+                    emitter.send(SseEmitter.event().name("error")
+                            .data("{\"message\":\"Either 'text' or 'sections' is required\"}"));
+                    emitter.complete();
+                } catch (Exception ignored) {}
+                return emitter;
+            }
+            sections = List.of(Map.of("title", label, "text", text.trim()));
         }
-        return knowledgeService.process(text.trim(), label.trim());
+
+        return knowledgeService.process(sections, label);
     }
 
     @PostMapping("/napoleon-chat")
     public ResponseEntity<Map<String, Object>> napoleonChat(@RequestBody Map<String, Object> body) {
         try {
             String question = (String) body.get("question");
-            String label    = (String) body.getOrDefault("label", "default");
+            String label    = String.valueOf(body.getOrDefault("label", "default"));
             if (question == null || question.isBlank()) {
                 return ResponseEntity.badRequest().body(Map.of("error", "question is required"));
             }
@@ -48,7 +67,6 @@ public class KnowledgeController {
                     ? (List<Map<String, String>>) body.get("history")
                     : List.of();
 
-            // Add current question to history for OpenAI
             List<Map<String, String>> messages = new java.util.ArrayList<>(history);
             messages.add(Map.of("role", "user", "content", question));
 
@@ -57,9 +75,8 @@ public class KnowledgeController {
             int maxTokens = body.containsKey("maxTokens")
                     ? ((Number) body.get("maxTokens")).intValue() : 800;
 
-            Map<String, Object> result = knowledgeService.chat(
-                    question, label, messages, temperature, maxTokens);
-            return ResponseEntity.ok(result);
+            return ResponseEntity.ok(
+                    knowledgeService.chat(question, label, messages, temperature, maxTokens));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
