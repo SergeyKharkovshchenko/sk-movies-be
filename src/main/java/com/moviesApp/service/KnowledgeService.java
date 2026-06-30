@@ -120,7 +120,17 @@ public class KnowledgeService {
             response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
         @SuppressWarnings("unchecked")
-        Map<String, Object> result = objectMapper.readValue(response, Map.class);
+        Map<String, Object> result = new LinkedHashMap<>(objectMapper.readValue(response, Map.class));
+        // Normalize: LLMs sometimes return "relationships", "rels", or "edges" instead of the
+        // contracted "entityRelationships". Rename whichever alias the model used.
+        if (!result.containsKey("entityRelationships")) {
+            for (String alias : List.of("relationships", "rels", "edges")) {
+                if (result.containsKey(alias)) {
+                    result.put("entityRelationships", result.remove(alias));
+                    break;
+                }
+            }
+        }
         return result;
     }
 
@@ -134,7 +144,7 @@ public class KnowledgeService {
         executor.submit(() -> {
             try {
                 // 1. Create entity nodes
-                try (Session session = driver.session()) {
+                try (Session session = driver.session()) { // Neo4j
                     for (Map<String, String> entity : entities) {
                         createEntityNode(entity.get("name"), entity.getOrDefault("type", "Entity"), label, session);
                         send(emitter, "entity_stored", Map.of(
@@ -162,7 +172,7 @@ public class KnowledgeService {
                     ));
 
                     // Create section sub-node + HAS_*_INFO relationship to entity
-                    try (Session session = driver.session()) {
+                    try (Session session = driver.session()) { // Neo4j
                         createSectionSubNode(sectionTitle, forEntity, sectionRelationship, label, session);
                     }
 
@@ -211,7 +221,7 @@ public class KnowledgeService {
                             uniqueNodeNames(sectionTriples).stream()
                     ).distinct().collect(Collectors.toList());
 
-                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, toEmbed);
+                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, toEmbed); // PostgreSQL
                     int embedded = 0;
                     for (int i = 0; i < toEmbed.size(); i += EMBED_BATCH) {
                         List<String> batch = toEmbed.subList(i, Math.min(i + EMBED_BATCH, toEmbed.size()));
@@ -226,7 +236,7 @@ public class KnowledgeService {
                                     "jina", vectors.get(j).length
                             ));
                         }
-                        repository.saveAll(embedEntities);
+                        repository.saveAll(embedEntities); // PostgreSQL
                         embedded += batch.size();
                         send(emitter, "embed_progress", Map.of(
                                 "section", sectionTitle,
@@ -243,7 +253,7 @@ public class KnowledgeService {
 
                 // 3. Entity → entity relationships
                 int relsCreated = 0;
-                try (Session session = driver.session()) {
+                try (Session session = driver.session()) { // Neo4j
                     relsCreated = createEntityRelationships(entityRelationships, label, session);
                 }
                 send(emitter, "relationships_stored", Map.of("count", relsCreated));
@@ -254,7 +264,7 @@ public class KnowledgeService {
                         .filter(Objects::nonNull)
                         .collect(Collectors.toList());
                 if (!entityNames.isEmpty()) {
-                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, entityNames);
+                    repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, entityNames); // PostgreSQL
                     List<float[]> vectors = jina.embed(entityNames);
                     List<BikeEmbedding> embedEntities = new ArrayList<>();
                     for (int i = 0; i < entityNames.size(); i++) {
@@ -266,7 +276,7 @@ public class KnowledgeService {
                                 "jina", vectors.get(i).length
                         ));
                     }
-                    repository.saveAll(embedEntities);
+                    repository.saveAll(embedEntities); // PostgreSQL
                     send(emitter, "entities_embedded", Map.of("count", entityNames.size()));
                 }
 
@@ -352,7 +362,7 @@ public class KnowledgeService {
                     // 4. Embed this section's unique node names and upsert into PG
                     List<String> nodeNames = uniqueNodeNames(sectionTriples);
                     if (!nodeNames.isEmpty()) {
-                        repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, nodeNames);
+                        repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, nodeNames); // PostgreSQL
                         int embedded = 0;
                         for (int i = 0; i < nodeNames.size(); i += EMBED_BATCH) {
                             List<String> batch = nodeNames.subList(i, Math.min(i + EMBED_BATCH, nodeNames.size()));
@@ -367,7 +377,7 @@ public class KnowledgeService {
                                         "jina", vectors.get(j).length
                                 ));
                             }
-                            repository.saveAll(entities);
+                            repository.saveAll(entities); // PostgreSQL
                             embedded += batch.size();
                             send(emitter, "embed_progress", Map.of(
                                     "section", sectionTitle,
@@ -408,7 +418,7 @@ public class KnowledgeService {
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens) throws Exception {
         float[] vec = jina.embed(List.of(question)).get(0);
-        List<BikeEmbedding> matches = repository.findSimilarByLabel(
+        List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
                 floatArrayToVectorString(vec), label, TOP_K);
 
         List<Map<String, Object>> graphContext = buildGraphContext(matches, label);
@@ -437,22 +447,22 @@ public class KnowledgeService {
     // ── Management ───────────────────────────────────────────────────────────
 
     public Map<String, Object> delete(String label) {
-        try (Session session = driver.session()) {
+        try (Session session = driver.session()) { // Neo4j
             session.run("MATCH (n:KGNode {sourceLabel: $label}) DETACH DELETE n", Map.of("label", label));
         }
-        repository.deleteBySourceTypeAndLabels(SOURCE_TYPE, label);
+        repository.deleteBySourceTypeAndLabels(SOURCE_TYPE, label); // PostgreSQL
         return Map.of("deleted", label);
     }
 
     public Map<String, Object> status() {
-        List<String> knownLabels = repository.findDistinctKnowledgeLabels();
+        List<String> knownLabels = repository.findDistinctKnowledgeLabels(); // PostgreSQL
         List<Map<String, Object>> perLabel = new ArrayList<>();
         for (String label : knownLabels) {
-            long embeddings = repository.countBySourceTypeAndLabels(SOURCE_TYPE, label);
+            long embeddings = repository.countBySourceTypeAndLabels(SOURCE_TYPE, label); // PostgreSQL
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("label", label);
             entry.put("embeddings", embeddings);
-            try (Session session = driver.session()) {
+            try (Session session = driver.session()) { // Neo4j
                 long nodes = session.run(
                         "MATCH (n:KGNode {sourceLabel: $l}) RETURN count(n) AS c", Map.of("l", label)
                 ).single().get("c").asLong();
@@ -474,7 +484,7 @@ public class KnowledgeService {
         return repository.findDistinctKnowledgeLabels();
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // ── Chunking ──────────────────────────────────────────────────────────────
 
     private List<String> chunk(String text) {
         List<String> chunks = new ArrayList<>();
@@ -493,9 +503,11 @@ public class KnowledgeService {
         return chunks;
     }
 
+    // ── Neo4j writers ─────────────────────────────────────────────────────────
+
     private void storeGraph(List<Triple> triples, String label, String sectionTitle) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
-        try (Session session = driver.session()) {
+        try (Session session = driver.session()) { // Neo4j
             for (Triple t : triples) {
                 String cypher = String.format(
                         "MERGE (a:KGNode:`%s` {name: $subject, sourceLabel: $label}) " +
@@ -526,7 +538,7 @@ public class KnowledgeService {
     private void createEntityNode(String name, String type, String label, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeType  = type.replaceAll("[^a-zA-Z0-9]", "_");
-        session.run(String.format(
+        session.run(String.format( // Neo4j
                 "MERGE (e:KGNode:`%s`:`%s` {name: $name, sourceLabel: $label}) " +
                 "ON CREATE SET e.nodeType = 'entity'",
                 safeLabel, safeType),
@@ -537,12 +549,12 @@ public class KnowledgeService {
                                       String sectionRelationship, String label, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
-        session.run(String.format(
+        session.run(String.format( // Neo4j
                 "MERGE (s:KGNode:`%s`:Section {name: $title, sourceLabel: $label}) " +
                 "ON CREATE SET s.nodeType = 'section', s.forEntity = $forEntity",
                 safeLabel),
                 Map.of("title", sectionTitle, "forEntity", forEntity, "label", label));
-        session.run(String.format(
+        session.run(String.format( // Neo4j
                 "MATCH (e:KGNode {name: $entity, sourceLabel: $label}) " +
                 "MATCH (s:KGNode {name: $title,  sourceLabel: $label}) " +
                 "MERGE (e)-[:`%s`]->(s)",
@@ -558,7 +570,7 @@ public class KnowledgeService {
             String pred = rel.get("predicate");
             if (from == null || to == null || pred == null) continue;
             String safePred = pred.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
-            session.run(String.format(
+            session.run(String.format( // Neo4j
                     "MATCH (a:KGNode {name: $from, sourceLabel: $label}) " +
                     "MATCH (b:KGNode {name: $to,   sourceLabel: $label}) " +
                     "MERGE (a)-[:`%s`]->(b)",
@@ -569,18 +581,22 @@ public class KnowledgeService {
         return count;
     }
 
+    // ── Neo4j queries ─────────────────────────────────────────────────────────
+
     private long countNodes(String label) {
-        try (Session session = driver.session()) {
+        try (Session session = driver.session()) { // Neo4j
             return session.run(
                     "MATCH (n:KGNode {sourceLabel: $l}) RETURN count(n) AS c", Map.of("l", label)
             ).single().get("c").asLong();
         }
     }
 
+    // ── Context builders ──────────────────────────────────────────────────────
+
     private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label) {
         List<Map<String, Object>> context = new ArrayList<>();
         Set<String> expandedNodes = new HashSet<>();
-        try (Session session = driver.session()) {
+        try (Session session = driver.session()) { // Neo4j
             for (BikeEmbedding match : matches) {
                 if (!expandedNodes.add(match.getName())) continue;
                 session.run(
@@ -617,6 +633,8 @@ public class KnowledgeService {
         }
         return sb.toString();
     }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
 
     private void send(SseEmitter emitter, String event, Object data) throws IOException {
         emitter.send(SseEmitter.event().name(event).data(objectMapper.writeValueAsString(data)));

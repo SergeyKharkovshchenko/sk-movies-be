@@ -1,22 +1,29 @@
 package com.moviesApp.controllers;
 
 import com.moviesApp.service.KnowledgeService;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @RestController
 @RequestMapping
 public class KnowledgeController {
 
-    private final KnowledgeService knowledgeService;
+    private static final Set<String> KNOWLEDGE_CACHES = Set.of("suggestGraph", "suggestSections");
 
-    public KnowledgeController(KnowledgeService knowledgeService) {
+    private final KnowledgeService knowledgeService;
+    private final CacheManager     cacheManager;
+
+    public KnowledgeController(KnowledgeService knowledgeService, CacheManager cacheManager) {
         this.knowledgeService = knowledgeService;
+        this.cacheManager     = cacheManager;
     }
 
     /**
@@ -173,5 +180,33 @@ public class KnowledgeController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError().build();
         }
+    }
+
+    /** Clear all knowledge caches (suggestGraph + suggestSections). */
+    @DeleteMapping("/knowledge/cache")
+    public ResponseEntity<Map<String, Object>> clearAllCaches() {
+        List<String> cleared = new ArrayList<>();
+        for (String name : KNOWLEDGE_CACHES) {
+            var cache = cacheManager.getCache(name);
+            if (cache != null) {
+                cache.clear();
+                cleared.add(name);
+            }
+        }
+        return ResponseEntity.ok(Map.of("cleared", cleared));
+    }
+
+    /** Clear one specific knowledge cache by name. */
+    @DeleteMapping("/knowledge/cache/{name}")
+    public ResponseEntity<Map<String, Object>> clearCache(@PathVariable String name) {
+        if (!KNOWLEDGE_CACHES.contains(name)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "error", "Unknown cache '" + name + "'",
+                    "available", KNOWLEDGE_CACHES
+            ));
+        }
+        var cache = cacheManager.getCache(name);
+        if (cache != null) cache.clear();
+        return ResponseEntity.ok(Map.of("cleared", name));
     }
 }
