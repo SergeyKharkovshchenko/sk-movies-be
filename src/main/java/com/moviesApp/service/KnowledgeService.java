@@ -13,6 +13,7 @@ import org.neo4j.driver.Session;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -36,12 +37,15 @@ public class KnowledgeService {
     private static final String SOURCE_TYPE       = "knowledge_node";
     private static final String CHUNK_SOURCE_TYPE = "chunk_text";
 
+    private static final Set<String> KNOWLEDGE_CACHES = Set.of("suggestGraph", "suggestSections");
+
     private final Driver                  driver;
     private final BikeEmbeddingRepository repository;
     private final JinaEmbeddingProvider   jina;
     private final EntityExtractorService  extractor;
     private final OpenAiService           openAi;
     private final ObjectMapper            objectMapper;
+    private final CacheManager            cacheManager;
     private final ExecutorService         executor = Executors.newCachedThreadPool();
 
     public KnowledgeService(
@@ -50,13 +54,15 @@ public class KnowledgeService {
             JinaEmbeddingProvider jina,
             EntityExtractorService extractor,
             OpenAiService openAi,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            CacheManager cacheManager) {
         this.driver       = driver;
         this.repository   = repository;
         this.jina         = jina;
         this.extractor    = extractor;
         this.openAi       = openAi;
         this.objectMapper = objectMapper;
+        this.cacheManager = cacheManager;
     }
 
     // ── Suggest sections ─────────────────────────────────────────────────────
@@ -622,7 +628,11 @@ public class KnowledgeService {
             session.run("MATCH (n:KGNode {sourceLabel: $label}) DETACH DELETE n", Map.of("label", label));
         }
         repository.deleteAllByLabels(label); // PostgreSQL — clears knowledge_node + chunk_text
-        return Map.of("deleted", label);
+        KNOWLEDGE_CACHES.forEach(name -> {
+            var cache = cacheManager.getCache(name);
+            if (cache != null) cache.clear();
+        });
+        return Map.of("deleted", label, "cachesCleared", KNOWLEDGE_CACHES);
     }
 
     public Map<String, Object> status() {
