@@ -463,28 +463,41 @@ public class KnowledgeService {
             contextText  = buildContextString(graphContext, label);
 
         } else {
-            // combined (default) — vector seeds from PostgreSQL + graph expansion from Neo4j
-            // Embed the question into the same 1024-dim vector space Jina used during indexing.
-            // Then run a cosine-distance search (pgvector <=> operator) against every stored node
-            // embedding for this label — returns the TOP_K node names whose meaning is semantically
-            // closest to the question. "Closest" = smallest angle between vectors in embedding space,
-            // not keyword overlap. E.g. "who led the French forces?" matches "Napoleon" even if the
-            // word "led" never appeared in the indexed text.
+            // combined (default): vector seeds (PostgreSQL) + keyword seeds (Neo4j) merged.
+            // Vector finds semantically similar nodes; keywords catch entities named explicitly in
+            // the question that vector distance may rank below the top-K threshold.
             float[] vec = jina.embed(List.of(question)).get(0);
             List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
-            seedNodes    = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
-            graphContext = buildGraphContext(matches, label, effectiveNeighborLimit);
-            contextText  = buildContextString(graphContext, label);
+            List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit);
+            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit); // Neo4j
+
+            // Merge and deduplicate — keyword ctx catches named entities vector may miss
+            Set<String> seen = new LinkedHashSet<>();
+            graphContext = Stream.concat(vectorCtx.stream(), keywordCtx.stream())
+                    .filter(e -> seen.add(
+                            e.getOrDefault("node", "") + "|" +
+                            e.getOrDefault("relationship", "") + "|" +
+                            e.getOrDefault("neighbor", "")))
+                    .collect(Collectors.toList());
+
+            seedNodes = Stream.concat(
+                    matches.stream().map(BikeEmbedding::getName),
+                    keywordCtx.stream().map(e -> (String) e.getOrDefault("node", "")).filter(s -> !s.isEmpty())
+            ).distinct().collect(Collectors.toList());
+
+            contextText = buildContextString(graphContext, label);
         }
 
         // strict=true: model must answer only from context, no pre-training knowledge allowed.
         // strict=false (default): model may supplement with general knowledge when context is thin.
         String systemPrompt = strict
-                ? "Answer ONLY using the knowledge graph context provided below. " +
-                  "Do not use any prior knowledge or information outside of this context. " +
-                  "If the answer is not explicitly present in the context, respond exactly: " +
-                  "'That information is not in the knowledge base.'\n\nContext:\n" + contextText
+                ? "You are a retrieval system, not an assistant. " +
+                  "Answer using ONLY the exact facts stated in the context below. " +
+                  "Do not add background, explanation, or any information not explicitly present in the context. " +
+                  "Do not say 'however' or 'historically' or reference any outside knowledge. " +
+                  "If the answer cannot be found in the context, output exactly this and nothing else: " +
+                  "'Not in knowledge base.'\n\nContext:\n" + contextText
                 : "You are a knowledgeable assistant. Use the following knowledge graph context to answer accurately. " +
                   "If the answer is not in the context, say so honestly.\n\nContext:\n" + contextText;
 
