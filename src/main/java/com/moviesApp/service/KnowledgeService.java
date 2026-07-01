@@ -417,6 +417,12 @@ public class KnowledgeService {
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens) throws Exception {
+        // Embed the question into the same 1024-dim vector space Jina used during indexing.
+        // Then run a cosine-distance search (pgvector <=> operator) against every stored node
+        // embedding for this label — returns the TOP_K node names whose meaning is semantically
+        // closest to the question. "Closest" = smallest angle between vectors in embedding space,
+        // not keyword overlap. E.g. "who led the French forces?" matches "Napoleon" even if the
+        // word "led" never appeared in the indexed text.
         float[] vec = jina.embed(List.of(question)).get(0);
         List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
                 floatArrayToVectorString(vec), label, TOP_K);
