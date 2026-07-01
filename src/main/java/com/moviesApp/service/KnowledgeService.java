@@ -436,7 +436,11 @@ public class KnowledgeService {
 
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
-                                    double temperature, int maxTokens) throws Exception {
+                                    double temperature, int maxTokens,
+                                    int topK, int neighborLimit) throws Exception {
+        int effectiveTopK          = topK > 0          ? topK          : TOP_K;
+        int effectiveNeighborLimit = neighborLimit > 0  ? neighborLimit : NEIGHBOR_LIMIT;
+
         // Embed the question into the same 1024-dim vector space Jina used during indexing.
         // Then run a cosine-distance search (pgvector <=> operator) against every stored node
         // embedding for this label — returns the TOP_K node names whose meaning is semantically
@@ -445,9 +449,9 @@ public class KnowledgeService {
         // word "led" never appeared in the indexed text.
         float[] vec = jina.embed(List.of(question)).get(0);
         List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
-                floatArrayToVectorString(vec), label, TOP_K);
+                floatArrayToVectorString(vec), label, effectiveTopK);
 
-        List<Map<String, Object>> graphContext = buildGraphContext(matches, label);
+        List<Map<String, Object>> graphContext = buildGraphContext(matches, label, effectiveNeighborLimit);
         String contextText = buildContextString(graphContext, label);
 
         List<Map<String, String>> messages = new ArrayList<>(history);
@@ -462,12 +466,20 @@ public class KnowledgeService {
                 messages
         );
 
-        return Map.of(
-                "answer",       answer,
-                "label",        label,
-                "graphContext", graphContext,
-                "question",     question
-        );
+        List<String> seedNodes = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("answer",       answer);
+        result.put("label",        label);
+        result.put("question",     question);
+        result.put("graphContext", graphContext);
+        result.put("retrievalInfo", Map.of(
+                "seedNodes",      seedNodes,
+                "contextTriplets", graphContext.size(),
+                "topK",           effectiveTopK,
+                "neighborLimit",  effectiveNeighborLimit
+        ));
+        return result;
     }
 
     // ── Management ───────────────────────────────────────────────────────────
@@ -619,7 +631,7 @@ public class KnowledgeService {
 
     // ── Context builders ──────────────────────────────────────────────────────
 
-    private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label) {
+    private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit) {
         List<Map<String, Object>> context = new ArrayList<>();
         Set<String> expandedNodes = new HashSet<>();
         try (Session session = driver.session()) { // Neo4j
@@ -628,7 +640,7 @@ public class KnowledgeService {
                 session.run(
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName LIMIT $limit",
-                        Map.of("name", match.getName(), "label", label, "limit", NEIGHBOR_LIMIT)
+                        Map.of("name", match.getName(), "label", label, "limit", neighborLimit)
                 ).list().forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
                         "relationship", r.get("relType").asString(""),
