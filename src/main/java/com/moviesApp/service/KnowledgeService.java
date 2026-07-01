@@ -437,7 +437,7 @@ public class KnowledgeService {
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens,
-                                    int topK, int neighborLimit, String ragMode) throws Exception {
+                                    int topK, int neighborLimit, String ragMode, boolean strict) throws Exception {
         int effectiveTopK          = topK > 0         ? topK         : TOP_K;
         int effectiveNeighborLimit = neighborLimit > 0 ? neighborLimit : NEIGHBOR_LIMIT;
 
@@ -478,14 +478,24 @@ public class KnowledgeService {
             contextText  = buildContextString(graphContext, label);
         }
 
+        // strict=true: model must answer only from context, no pre-training knowledge allowed.
+        // strict=false (default): model may supplement with general knowledge when context is thin.
+        String systemPrompt = strict
+                ? "Answer ONLY using the knowledge graph context provided below. " +
+                  "Do not use any prior knowledge or information outside of this context. " +
+                  "If the answer is not explicitly present in the context, respond exactly: " +
+                  "'That information is not in the knowledge base.'\n\nContext:\n" + contextText
+                : "You are a knowledgeable assistant. Use the following knowledge graph context to answer accurately. " +
+                  "If the answer is not in the context, say so honestly.\n\nContext:\n" + contextText;
+
+        double effectiveTemperature = temperature > 0 ? temperature : 0.7;
+
         List<Map<String, String>> messages = new ArrayList<>(history);
-        messages.add(0, Map.of("role", "system", "content",
-                "You are a knowledgeable assistant. Use the following knowledge graph context to answer accurately. " +
-                "If the answer is not in the context, say so honestly.\n\nContext:\n" + contextText));
+        messages.add(0, Map.of("role", "system", "content", systemPrompt));
 
         String answer = openAi.chat(
                 "gpt-4o-mini",
-                temperature > 0 ? temperature : 0.7,
+                effectiveTemperature,
                 maxTokens > 0 ? maxTokens : 800,
                 messages
         );
@@ -497,6 +507,8 @@ public class KnowledgeService {
         result.put("graphContext", graphContext);
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
+                "strict",          strict,
+                "temperature",     effectiveTemperature,
                 "seedNodes",       seedNodes,
                 "contextTriplets", graphContext.size(),
                 "topK",            effectiveTopK,

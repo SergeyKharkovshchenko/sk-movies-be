@@ -153,14 +153,15 @@ public class KnowledgeController {
             List<Map<String, String>> messages = new java.util.ArrayList<>(history);
             messages.add(Map.of("role", "user", "content", question));
 
-            double temperature   = body.containsKey("temperature")   ? ((Number) body.get("temperature")).doubleValue()  : 0.7;
-            int    maxTokens     = body.containsKey("maxTokens")     ? ((Number) body.get("maxTokens")).intValue()         : 800;
-            int    topK          = body.containsKey("topK")          ? ((Number) body.get("topK")).intValue()              : 0;
-            int    neighborLimit = body.containsKey("neighborLimit") ? ((Number) body.get("neighborLimit")).intValue()     : 0;
-            String ragMode       = String.valueOf(body.getOrDefault("ragMode", "combined"));
+            double  temperature   = body.containsKey("temperature")   ? ((Number) body.get("temperature")).doubleValue()  : 0.7;
+            int     maxTokens     = body.containsKey("maxTokens")     ? ((Number) body.get("maxTokens")).intValue()         : 800;
+            int     topK          = body.containsKey("topK")          ? ((Number) body.get("topK")).intValue()              : 0;
+            int     neighborLimit = body.containsKey("neighborLimit") ? ((Number) body.get("neighborLimit")).intValue()     : 0;
+            String  ragMode       = String.valueOf(body.getOrDefault("ragMode", "combined"));
+            boolean strict        = Boolean.TRUE.equals(body.get("strict"));
 
             return ResponseEntity.ok(
-                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit, ragMode));
+                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit, ragMode, strict));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
