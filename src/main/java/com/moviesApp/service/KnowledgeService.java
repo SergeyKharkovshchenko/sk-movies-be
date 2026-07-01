@@ -9,7 +9,10 @@ import com.moviesApp.rag.OpenAiService;
 import com.moviesApp.repositories.BikeEmbeddingRepository;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.Session;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -22,6 +25,8 @@ import java.util.stream.Stream;
 
 @Service
 public class KnowledgeService {
+
+    private static final Logger log = LoggerFactory.getLogger(KnowledgeService.class);
 
     private static final int    CHUNK_SIZE     = 1500;
     private static final int    CHUNK_OVERLAP  = 200;
@@ -67,6 +72,7 @@ public class KnowledgeService {
             - No markdown, no explanation — just the JSON array
             """;
 
+    @Cacheable("suggestSections")
     public List<Map<String, String>> suggestSections(String text) throws Exception {
         String response = openAi.chat(SECTION_SYSTEM_PROMPT, text).strip();
         if (response.startsWith("```")) {
@@ -114,6 +120,7 @@ public class KnowledgeService {
             - Only create entityRelationships between entities that are explicitly connected in the text
             """;
 
+    @Cacheable("suggestGraph")
     public Map<String, Object> suggestGraph(String text) throws Exception {
         String response = openAi.chat(GRAPH_DESIGN_PROMPT, text).strip();
         if (response.startsWith("```")) {
@@ -143,6 +150,19 @@ public class KnowledgeService {
         SseEmitter emitter = new SseEmitter(300_000L);
         executor.submit(() -> {
             try {
+                long existing = countNodes(label);
+                if (existing > 0) {
+                    log.warn("[already-exists guard] Neo4j already contains {} KGNode records with sourceLabel='{}' — skipping re-processing.", existing, label);
+                    send(emitter, "already_exists", Map.of(
+                            "label", label,
+                            "nodes", existing,
+                            "alreadyExistsCheckGuard", true,
+                            "message", "Label already processed. DELETE /knowledge/" + label + " first to re-process."
+                    ));
+                    emitter.complete();
+                    return;
+                }
+
                 // 1. Create entity nodes
                 try (Session session = driver.session()) { // Neo4j
                     for (Map<String, String> entity : entities) {

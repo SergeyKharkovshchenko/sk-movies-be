@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,7 +39,12 @@ public class KnowledgeController {
             return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
         }
         try {
-            return ResponseEntity.ok(knowledgeService.suggestGraph(text.trim()));
+            String key = text.trim();
+            var cache = cacheManager.getCache("suggestGraph");
+            boolean wasCached = cache != null && cache.get(key) != null;
+            Map<String, Object> result = new LinkedHashMap<>(knowledgeService.suggestGraph(key));
+            result.put("cached", wasCached);
+            return ResponseEntity.ok(result);
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
@@ -81,7 +87,14 @@ public class KnowledgeController {
             return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
         }
         try {
-            return ResponseEntity.ok(knowledgeService.suggestSections(text.trim()));
+            String key = text.trim();
+            var cache = cacheManager.getCache("suggestSections");
+            boolean wasCached = cache != null && cache.get(key) != null;
+            List<?> sections = knowledgeService.suggestSections(key);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("sections", sections);
+            result.put("cached", wasCached);
+            return ResponseEntity.ok(result);
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
