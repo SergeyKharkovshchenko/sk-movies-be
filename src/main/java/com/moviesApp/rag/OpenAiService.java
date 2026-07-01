@@ -55,9 +55,15 @@ public class OpenAiService {
         return (String) message.get("content");
     }
 
-    // Convenience for simple system+user extraction calls
+    // Convenience for simple system+user calls (extraction, short outputs)
     public String chat(String systemPrompt, String userContent) throws Exception {
-        return chat("gpt-4o-mini", 0.2, 2000, List.of(
+        return chat(systemPrompt, userContent, 2000);
+    }
+
+    // Convenience with explicit token budget — use for graph design / section splitting
+    // where verbatim text output can be 10-20k tokens on a full article
+    public String chat(String systemPrompt, String userContent, int maxTokens) throws Exception {
+        return chat("gpt-4o-mini", 0.2, maxTokens, List.of(
                 Map.of("role", "system", "content", systemPrompt),
                 Map.of("role", "user",   "content", userContent)
         ));
