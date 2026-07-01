@@ -437,7 +437,8 @@ public class KnowledgeService {
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens,
-                                    int topK, int neighborLimit, String ragMode, boolean strict) throws Exception {
+                                    int topK, int neighborLimit, String ragMode, boolean strict,
+                                    String seedPriority) throws Exception {
         int effectiveTopK          = topK > 0         ? topK         : TOP_K;
         int effectiveNeighborLimit = neighborLimit > 0 ? neighborLimit : NEIGHBOR_LIMIT;
 
@@ -463,28 +464,35 @@ public class KnowledgeService {
             contextText  = buildContextString(graphContext, label);
 
         } else {
-            // combined (default): vector seeds (PostgreSQL) + keyword seeds (Neo4j) merged.
-            // Vector finds semantically similar nodes; keywords catch entities named explicitly in
-            // the question that vector distance may rank below the top-K threshold.
+            // combined: graph keyword seeds (Neo4j) + vector seeds (PostgreSQL) merged.
+            // seedPriority controls which appears first in the context window fed to the LLM —
+            // "graph" (default): precise entity matches lead, vector fills semantic gaps.
+            // "vector": semantic similarity leads, graph keyword matches supplement.
             float[] vec = jina.embed(List.of(question)).get(0);
             List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
             List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit);
             List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit); // Neo4j
 
-            // Merge and deduplicate — keyword ctx catches named entities vector may miss
+            boolean graphFirst = !"vector".equals(seedPriority);
+            Stream<Map<String, Object>> first  = graphFirst ? keywordCtx.stream() : vectorCtx.stream();
+            Stream<Map<String, Object>> second = graphFirst ? vectorCtx.stream()  : keywordCtx.stream();
+
             Set<String> seen = new LinkedHashSet<>();
-            graphContext = Stream.concat(vectorCtx.stream(), keywordCtx.stream())
+            graphContext = Stream.concat(first, second)
                     .filter(e -> seen.add(
                             e.getOrDefault("node", "") + "|" +
                             e.getOrDefault("relationship", "") + "|" +
                             e.getOrDefault("neighbor", "")))
                     .collect(Collectors.toList());
 
-            seedNodes = Stream.concat(
-                    matches.stream().map(BikeEmbedding::getName),
-                    keywordCtx.stream().map(e -> (String) e.getOrDefault("node", "")).filter(s -> !s.isEmpty())
-            ).distinct().collect(Collectors.toList());
+            Stream<String> firstSeeds  = graphFirst
+                    ? keywordCtx.stream().map(e -> (String) e.getOrDefault("node", "")).filter(s -> !s.isEmpty())
+                    : matches.stream().map(BikeEmbedding::getName);
+            Stream<String> secondSeeds = graphFirst
+                    ? matches.stream().map(BikeEmbedding::getName)
+                    : keywordCtx.stream().map(e -> (String) e.getOrDefault("node", "")).filter(s -> !s.isEmpty());
+            seedNodes = Stream.concat(firstSeeds, secondSeeds).distinct().collect(Collectors.toList());
 
             contextText = buildContextString(graphContext, label);
         }
@@ -520,6 +528,7 @@ public class KnowledgeService {
         result.put("graphContext", graphContext);
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
+                "seedPriority",    seedPriority,
                 "strict",          strict,
                 "temperature",     effectiveTemperature,
                 "seedNodes",       seedNodes,
