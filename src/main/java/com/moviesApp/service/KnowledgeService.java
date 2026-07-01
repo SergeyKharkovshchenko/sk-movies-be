@@ -81,7 +81,7 @@ public class KnowledgeService {
 
     @Cacheable("suggestSections")
     public List<Map<String, String>> suggestSections(String text) throws Exception {
-        String response = openAi.chat(SECTION_SYSTEM_PROMPT, text, 16000).strip();
+        String response = openAi.chatExtract(SECTION_SYSTEM_PROMPT, text, 16000).strip();
         if (response.startsWith("```")) {
             response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
@@ -151,7 +151,7 @@ public class KnowledgeService {
 
     @Cacheable("suggestGraph")
     public Map<String, Object> suggestGraph(String text) throws Exception {
-        String response = openAi.chat(GRAPH_DESIGN_PROMPT, text, 16000).strip();
+        String response = openAi.chatDesign(GRAPH_DESIGN_PROMPT, text, 16000).strip();
         if (response.startsWith("```")) {
             response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
@@ -618,8 +618,7 @@ public class KnowledgeService {
         List<Map<String, String>> messages = new ArrayList<>(history);
         messages.add(0, Map.of("role", "system", "content", systemPrompt));
 
-        String answer = openAi.chat(
-                "gpt-4o-mini",
+        String answer = openAi.chatDesign(
                 effectiveTemperature,
                 maxTokens > 0 ? maxTokens : 800,
                 messages

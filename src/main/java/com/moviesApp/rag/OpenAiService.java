@@ -20,6 +20,14 @@ public class OpenAiService {
     @Value("${OPENAI_API_KEY}")
     private String apiKey;
 
+    /** Complex structured outputs — suggestGraph, RAG chat. Override via OPENAI_MODEL_DESIGN env var. */
+    @Value("${openai.model.design:gpt-4o-mini}")
+    private String designModel;
+
+    /** High-volume simple tasks — suggestSections, triple extraction. Override via OPENAI_MODEL_EXTRACT env var. */
+    @Value("${openai.model.extract:gpt-4.1-nano}")
+    private String extractModel;
+
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
@@ -55,17 +63,37 @@ public class OpenAiService {
         return (String) message.get("content");
     }
 
-    // Convenience for simple system+user calls (extraction, short outputs)
-    public String chat(String systemPrompt, String userContent) throws Exception {
-        return chat(systemPrompt, userContent, 2000);
-    }
-
-    // Convenience with explicit token budget — use for graph design / section splitting
-    // where verbatim text output can be 10-20k tokens on a full article
-    public String chat(String systemPrompt, String userContent, int maxTokens) throws Exception {
-        return chat("gpt-4o-mini", 0.2, maxTokens, List.of(
+    /** suggestGraph — designModel, caller supplies token budget. */
+    public String chatDesign(String systemPrompt, String userContent, int maxTokens) throws Exception {
+        return chat(designModel, 0.2, maxTokens, List.of(
                 Map.of("role", "system", "content", systemPrompt),
                 Map.of("role", "user",   "content", userContent)
         ));
+    }
+
+    /** RAG chat with full message history — designModel, caller supplies temperature and token budget. */
+    public String chatDesign(double temperature, int maxTokens, List<Map<String, String>> messages) throws Exception {
+        return chat(designModel, temperature, maxTokens, messages);
+    }
+
+    /** Triple extraction per chunk — extractModel, 2000 token default. */
+    public String chatExtract(String systemPrompt, String userContent) throws Exception {
+        return chat(extractModel, 0.2, 2000, List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user",   "content", userContent)
+        ));
+    }
+
+    /** suggestSections — extractModel, large token budget for verbatim text output. */
+    public String chatExtract(String systemPrompt, String userContent, int maxTokens) throws Exception {
+        return chat(extractModel, 0.2, maxTokens, List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user",   "content", userContent)
+        ));
+    }
+
+    // Kept for EntityExtractorService compatibility — routes to extractModel at 2000 tokens
+    public String chat(String systemPrompt, String userContent) throws Exception {
+        return chatExtract(systemPrompt, userContent);
     }
 }
