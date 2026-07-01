@@ -193,7 +193,7 @@ public class KnowledgeService {
 
                     // Create section sub-node + HAS_*_INFO relationship to entity
                     try (Session session = driver.session()) { // Neo4j
-                        createSectionSubNode(sectionTitle, forEntity, sectionRelationship, label, session);
+                        createSectionSubNode(sectionTitle, forEntity, sectionRelationship, label, sectionText, session);
                     }
 
                     if (sectionText == null || sectionText.isBlank()) {
@@ -641,14 +641,15 @@ public class KnowledgeService {
     }
 
     private void createSectionSubNode(String sectionTitle, String forEntity,
-                                      String sectionRelationship, String label, Session session) {
+                                      String sectionRelationship, String label, String text, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
         session.run(String.format( // Neo4j
                 "MERGE (s:KGNode:`%s`:Section {name: $title, sourceLabel: $label}) " +
-                "ON CREATE SET s.nodeType = 'section', s.forEntity = $forEntity",
+                "ON CREATE SET s.nodeType = 'section', s.forEntity = $forEntity, s.text = $text",
                 safeLabel),
-                Map.of("title", sectionTitle, "forEntity", forEntity, "label", label));
+                Map.of("title", sectionTitle, "forEntity", forEntity, "label", label,
+                       "text", text != null ? text : ""));
         session.run(String.format( // Neo4j
                 "MATCH (e:KGNode {name: $entity, sourceLabel: $label}) " +
                 "MATCH (s:KGNode {name: $title,  sourceLabel: $label}) " +
@@ -711,14 +712,16 @@ public class KnowledgeService {
             session.run(
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
-                    "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName " +
+                    "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
+                    "coalesce(nb.text, '') AS neighborText " +
                     "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit)
             ).list().forEach(r -> context.add(Map.of(
                     "node",         r.get("node").asString(""),
                     "relationship", r.get("relType").asString(""),
-                    "neighbor",     r.get("neighborName").asString("")
+                    "neighbor",     r.get("neighborName").asString(""),
+                    "neighborText", r.get("neighborText").asString("")
             )));
         } catch (Exception e) {
             context.add(Map.of("error", "Graph keyword search failed: " + e.getMessage()));
@@ -740,7 +743,8 @@ public class KnowledgeService {
                 if (!expandedNodes.add(match.getName())) continue;
                 session.run(
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
-                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName " +
+                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
+                        "coalesce(nb.text, '') AS neighborText " +
                         // Entity-to-entity relationships (PARTICIPATED_IN, RELATED_TO, etc.) come first;
                         // section sub-node links (HAS_*_INFO) are pushed to the end of the limit window.
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
@@ -749,7 +753,8 @@ public class KnowledgeService {
                 ).list().forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
                         "relationship", r.get("relType").asString(""),
-                        "neighbor",     r.get("neighborName").asString("")
+                        "neighbor",     r.get("neighborName").asString(""),
+                        "neighborText", r.get("neighborText").asString("")
                 )));
             }
         } catch (Exception e) {
@@ -772,6 +777,11 @@ public class KnowledgeService {
             if (e.containsKey("neighbor")) {
                 sb.append(String.format("- %s %s %s\n",
                         e.get("node"), e.get("relationship"), e.get("neighbor")));
+                String text = (String) e.getOrDefault("neighborText", "");
+                if (text != null && !text.isEmpty()) {
+                    String snippet = text.length() > 500 ? text.substring(0, 500) + "..." : text;
+                    sb.append("  [").append(snippet).append("]\n");
+                }
             }
         }
         return sb.toString();
