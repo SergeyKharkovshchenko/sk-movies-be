@@ -3,6 +3,7 @@ package com.moviesApp.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moviesApp.entities.BikeEmbedding;
 import com.moviesApp.rag.EntityExtractorService;
+import com.moviesApp.rag.EntityExtractorService.ExtractionResult;
 import com.moviesApp.rag.EntityExtractorService.Triple;
 import com.moviesApp.rag.JinaEmbeddingProvider;
 import com.moviesApp.rag.OpenAiService;
@@ -29,11 +30,11 @@ public class KnowledgeService {
     private static final Logger log = LoggerFactory.getLogger(KnowledgeService.class);
 
     private static final int    CHUNK_SIZE     = 1500;
-    private static final int    CHUNK_OVERLAP  = 200;
     private static final int    TOP_K          = 5;
     private static final int    NEIGHBOR_LIMIT = 10;
     private static final int    EMBED_BATCH    = 50;
-    private static final String SOURCE_TYPE    = "knowledge_node";
+    private static final String SOURCE_TYPE       = "knowledge_node";
+    private static final String CHUNK_SOURCE_TYPE = "chunk_text";
 
     private final Driver                  driver;
     private final BikeEmbeddingRepository repository;
@@ -205,29 +206,43 @@ public class KnowledgeService {
                         continue;
                     }
 
-                    // Chunk
+                    // Chunk (sentence-aware)
                     List<String> chunks = chunk(sectionText);
                     send(emitter, "chunk_done", Map.of("section", sectionTitle, "count", chunks.size()));
 
-                    // Extract triples
+                    // Create Chunk nodes in Neo4j + extract triples/descriptions per chunk
                     List<Triple> sectionTriples = new ArrayList<>();
-                    for (int ci = 0; ci < chunks.size(); ci++) {
-                        List<Triple> triples = extractor.extract(chunks.get(ci));
-                        for (Triple t : triples) {
-                            if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
-                                sectionTriples.add(t);
+                    Map<String, String> sectionDescriptions = new HashMap<>();
+                    List<String> chunkIds   = new ArrayList<>();
+                    List<String> chunkTexts = new ArrayList<>();
+
+                    try (Session session = driver.session()) { // Neo4j
+                        for (int ci = 0; ci < chunks.size(); ci++) {
+                            String chunkText = chunks.get(ci);
+                            String chunkId   = storeChunkNode(chunkText, ci, sectionTitle, label, session);
+                            chunkIds.add(chunkId);
+                            chunkTexts.add(chunkText);
+
+                            ExtractionResult extracted = extractor.extract(chunkText);
+                            for (Triple t : extracted.triples()) {
+                                if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
+                                    sectionTriples.add(t);
+                                }
                             }
+                            // First-write-wins: earlier chunks' descriptions take priority
+                            extracted.descriptions().forEach(sectionDescriptions::putIfAbsent);
+
+                            send(emitter, "extract_progress", Map.of(
+                                    "section", sectionTitle,
+                                    "chunk", ci + 1, "totalChunks", chunks.size(),
+                                    "chunkTriples", extracted.triples().size(),
+                                    "sectionTriples", sectionTriples.size()
+                            ));
                         }
-                        send(emitter, "extract_progress", Map.of(
-                                "section", sectionTitle,
-                                "chunk", ci + 1, "totalChunks", chunks.size(),
-                                "chunkTriples", triples.size(),
-                                "sectionTriples", sectionTriples.size()
-                        ));
                     }
 
-                    // Store triples (nodes tagged with sectionTitle)
-                    storeGraph(sectionTriples, label, sectionTitle);
+                    // Store triples + entity descriptions in Neo4j
+                    storeGraph(sectionTriples, sectionDescriptions, label, sectionTitle);
                     totalTriples += sectionTriples.size();
                     send(emitter, "graph_stored", Map.of(
                             "section", sectionTitle,
@@ -235,7 +250,7 @@ public class KnowledgeService {
                             "totalTriples", totalTriples
                     ));
 
-                    // Embed section sub-node name + unique triple node names
+                    // Embed entity names (knowledge_node) — for graph-mode retrieval
                     List<String> toEmbed = Stream.concat(
                             Stream.of(sectionTitle),
                             uniqueNodeNames(sectionTriples).stream()
@@ -264,10 +279,27 @@ public class KnowledgeService {
                         ));
                     }
 
+                    // Embed chunk TEXT (chunk_text) — for semantic passage retrieval
+                    if (!chunkTexts.isEmpty()) {
+                        List<float[]> chunkVecs = jina.embed(chunkTexts);
+                        List<BikeEmbedding> chunkEmbs = new ArrayList<>();
+                        for (int ci = 0; ci < chunkIds.size(); ci++) {
+                            chunkEmbs.add(new BikeEmbedding(
+                                    CHUNK_SOURCE_TYPE,
+                                    label + "_ck_" + Math.abs(chunkIds.get(ci).hashCode()),
+                                    chunkIds.get(ci), label, chunkTexts.get(ci),
+                                    floatArrayToVectorString(chunkVecs.get(ci)),
+                                    "jina", chunkVecs.get(ci).length
+                            ));
+                        }
+                        repository.saveAll(chunkEmbs); // PostgreSQL
+                        embedded += chunkTexts.size();
+                    }
+
                     send(emitter, "section_done", Map.of(
                             "section", sectionTitle, "forEntity", forEntity,
                             "index", si + 1, "total", totalSections,
-                            "triples", sectionTriples.size(), "embedded", toEmbed.size()
+                            "triples", sectionTriples.size(), "embedded", embedded
                     ));
                 }
 
@@ -347,31 +379,56 @@ public class KnowledgeService {
                             "section", sectionTitle, "index", si + 1, "total", totalSections
                     ));
 
-                    // 1. Chunk
+                    // 1. Sentence-aware chunking
                     List<String> chunks = chunk(sectionText);
                     send(emitter, "chunk_done", Map.of(
                             "section", sectionTitle, "count", chunks.size()
                     ));
 
-                    // 2. Extract triples for this section
-                    List<Triple> sectionTriples = new ArrayList<>();
-                    for (int ci = 0; ci < chunks.size(); ci++) {
-                        List<Triple> triples = extractor.extract(chunks.get(ci));
-                        for (Triple t : triples) {
-                            if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
-                                sectionTriples.add(t);
-                            }
-                        }
-                        send(emitter, "extract_progress", Map.of(
-                                "section", sectionTitle,
-                                "chunk", ci + 1, "totalChunks", chunks.size(),
-                                "chunkTriples", triples.size(),
-                                "sectionTriples", sectionTriples.size()
-                        ));
+                    // 2. Create a section node so chunks have a parent to link to
+                    String safeLabelFlat = label.replaceAll("[^a-zA-Z0-9]", "_");
+                    try (Session session = driver.session()) { // Neo4j
+                        session.run(String.format(
+                                "MERGE (s:KGNode:`%s`:Section {name: $title, sourceLabel: $label}) " +
+                                "ON CREATE SET s.nodeType = 'section', s.text = $text",
+                                safeLabelFlat),
+                                Map.of("title", sectionTitle, "label", label,
+                                       "text", sectionText.length() > 2000
+                                               ? sectionText.substring(0, 2000) : sectionText));
                     }
 
-                    // 3. Store section triples in Neo4j with sectionTitle on nodes
-                    storeGraph(sectionTriples, label, sectionTitle);
+                    // 3. Create Chunk nodes + extract triples/descriptions per chunk
+                    List<Triple> sectionTriples = new ArrayList<>();
+                    Map<String, String> sectionDescriptions = new HashMap<>();
+                    List<String> chunkIds   = new ArrayList<>();
+                    List<String> chunkTexts = new ArrayList<>();
+
+                    try (Session session = driver.session()) { // Neo4j
+                        for (int ci = 0; ci < chunks.size(); ci++) {
+                            String chunkText = chunks.get(ci);
+                            String chunkId   = storeChunkNode(chunkText, ci, sectionTitle, label, session);
+                            chunkIds.add(chunkId);
+                            chunkTexts.add(chunkText);
+
+                            ExtractionResult extracted = extractor.extract(chunkText);
+                            for (Triple t : extracted.triples()) {
+                                if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
+                                    sectionTriples.add(t);
+                                }
+                            }
+                            extracted.descriptions().forEach(sectionDescriptions::putIfAbsent);
+
+                            send(emitter, "extract_progress", Map.of(
+                                    "section", sectionTitle,
+                                    "chunk", ci + 1, "totalChunks", chunks.size(),
+                                    "chunkTriples", extracted.triples().size(),
+                                    "sectionTriples", sectionTriples.size()
+                            ));
+                        }
+                    }
+
+                    // 4. Store triples + descriptions in Neo4j
+                    storeGraph(sectionTriples, sectionDescriptions, label, sectionTitle);
                     totalTriples += sectionTriples.size();
                     send(emitter, "graph_stored", Map.of(
                             "section", sectionTitle,
@@ -379,11 +436,11 @@ public class KnowledgeService {
                             "totalTriples", totalTriples
                     ));
 
-                    // 4. Embed this section's unique node names and upsert into PG
+                    // 5. Embed entity names (knowledge_node)
                     List<String> nodeNames = uniqueNodeNames(sectionTriples);
+                    int embedded = 0;
                     if (!nodeNames.isEmpty()) {
                         repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, nodeNames); // PostgreSQL
-                        int embedded = 0;
                         for (int i = 0; i < nodeNames.size(); i += EMBED_BATCH) {
                             List<String> batch = nodeNames.subList(i, Math.min(i + EMBED_BATCH, nodeNames.size()));
                             List<float[]> vectors = jina.embed(batch);
@@ -406,9 +463,26 @@ public class KnowledgeService {
                         }
                     }
 
+                    // 6. Embed chunk TEXT (chunk_text) — semantic passage retrieval
+                    if (!chunkTexts.isEmpty()) {
+                        List<float[]> chunkVectors = jina.embed(chunkTexts);
+                        List<BikeEmbedding> chunkEmbs = new ArrayList<>();
+                        for (int ci = 0; ci < chunkIds.size(); ci++) {
+                            chunkEmbs.add(new BikeEmbedding(
+                                    CHUNK_SOURCE_TYPE,
+                                    label + "_ck_" + Math.abs(chunkIds.get(ci).hashCode()),
+                                    chunkIds.get(ci), label, chunkTexts.get(ci),
+                                    floatArrayToVectorString(chunkVectors.get(ci)),
+                                    "jina", chunkVectors.get(ci).length
+                            ));
+                        }
+                        repository.saveAll(chunkEmbs); // PostgreSQL
+                        embedded += chunkTexts.size();
+                    }
+
                     send(emitter, "section_done", Map.of(
                             "section", sectionTitle, "index", si + 1, "total", totalSections,
-                            "triples", sectionTriples.size(), "embedded", nodeNames.size()
+                            "triples", sectionTriples.size(), "embedded", embedded
                     ));
                 }
 
@@ -447,13 +521,13 @@ public class KnowledgeService {
         String                    contextText;
 
         if ("vector".equals(ragMode)) {
-            // PostgreSQL only — embed question, cosine-search node names, skip Neo4j entirely
+            // PostgreSQL only — embed question, search both entity names and chunk text
             float[] vec = jina.embed(List.of(question)).get(0);
-            List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
+            List<BikeEmbedding> matches = repository.findSimilarAllTypesByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
             seedNodes    = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
             graphContext = List.of();
-            contextText  = buildVectorContextString(seedNodes, label);
+            contextText  = buildVectorContextFromMatches(matches, label);
 
         } else if ("graph".equals(ragMode)) {
             // Neo4j only — keyword-match node names, expand relationships, skip PostgreSQL
@@ -464,15 +538,13 @@ public class KnowledgeService {
             contextText  = buildContextString(graphContext, label);
 
         } else {
-            // combined: graph keyword seeds (Neo4j) + vector seeds (PostgreSQL) merged.
-            // seedPriority controls which appears first in the context window fed to the LLM —
-            // "graph" (default): precise entity matches lead, vector fills semantic gaps.
-            // "vector": semantic similarity leads, graph keyword matches supplement.
+            // combined: keyword graph seeds (Neo4j) + vector seeds — entity names + chunk passages (PostgreSQL)
+            // seedPriority: "graph" (default) puts precise keyword matches first; "vector" puts semantic matches first
             float[] vec = jina.embed(List.of(question)).get(0);
-            List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
+            List<BikeEmbedding> matches = repository.findSimilarAllTypesByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
             List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit);
-            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit); // Neo4j
+            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit);
 
             boolean graphFirst = !"vector".equals(seedPriority);
             Stream<Map<String, Object>> first  = graphFirst ? keywordCtx.stream() : vectorCtx.stream();
@@ -480,10 +552,14 @@ public class KnowledgeService {
 
             Set<String> seen = new LinkedHashSet<>();
             graphContext = Stream.concat(first, second)
-                    .filter(e -> seen.add(
-                            e.getOrDefault("node", "") + "|" +
-                            e.getOrDefault("relationship", "") + "|" +
-                            e.getOrDefault("neighbor", "")))
+                    .filter(e -> {
+                        if (e.containsKey("passage"))
+                            return seen.add("passage:" + e.getOrDefault("source", ""));
+                        return seen.add(
+                                e.getOrDefault("node", "") + "|" +
+                                e.getOrDefault("relationship", "") + "|" +
+                                e.getOrDefault("neighbor", ""));
+                    })
                     .collect(Collectors.toList());
 
             Stream<String> firstSeeds  = graphFirst
@@ -545,7 +621,7 @@ public class KnowledgeService {
         try (Session session = driver.session()) { // Neo4j
             session.run("MATCH (n:KGNode {sourceLabel: $label}) DETACH DELETE n", Map.of("label", label));
         }
-        repository.deleteBySourceTypeAndLabels(SOURCE_TYPE, label); // PostgreSQL
+        repository.deleteAllByLabels(label); // PostgreSQL — clears knowledge_node + chunk_text
         return Map.of("deleted", label);
     }
 
@@ -582,25 +658,33 @@ public class KnowledgeService {
     // ── Chunking ──────────────────────────────────────────────────────────────
 
     private List<String> chunk(String text) {
-        List<String> chunks = new ArrayList<>();
-        int len = text.length();
-        int start = 0;
-        while (start < len) {
-            int end = Math.min(start + CHUNK_SIZE, len);
-            if (end < len) {
-                int dot = text.lastIndexOf('.', end);
-                if (dot > start + CHUNK_SIZE / 2) end = dot + 1;
+        // Split on sentence boundaries so extraction never sees a half-sentence
+        String[] sentences = text.split("(?<=[.!?])\\s+");
+        List<String> chunks  = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        List<String> overlap  = new ArrayList<>(); // last 2 sentences carried into next chunk
+
+        for (String raw : sentences) {
+            String s = raw.trim();
+            if (s.isEmpty()) continue;
+            if (current.length() > 0 && current.length() + s.length() + 1 > CHUNK_SIZE) {
+                chunks.add(current.toString().trim());
+                current = new StringBuilder();
+                for (String prev : overlap) current.append(prev).append(" ");
+                overlap.clear();
             }
-            String chunk = text.substring(start, end).trim();
-            if (!chunk.isEmpty()) chunks.add(chunk);
-            start = Math.max(start + 1, end - CHUNK_OVERLAP);
+            current.append(s).append(" ");
+            overlap.add(s);
+            if (overlap.size() > 2) overlap.remove(0);
         }
-        return chunks;
+        if (!current.isEmpty()) chunks.add(current.toString().trim());
+        return chunks.isEmpty() ? List.of(text.trim()) : chunks;
     }
 
     // ── Neo4j writers ─────────────────────────────────────────────────────────
 
-    private void storeGraph(List<Triple> triples, String label, String sectionTitle) {
+    private void storeGraph(List<Triple> triples, Map<String, String> descriptions,
+                            String label, String sectionTitle) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         try (Session session = driver.session()) { // Neo4j
             for (Triple t : triples) {
@@ -618,7 +702,34 @@ public class KnowledgeService {
                         "sectionTitle", sectionTitle
                 ));
             }
+            // Store entity descriptions — first-write-wins so earlier chunks keep better descriptions
+            for (Map.Entry<String, String> d : descriptions.entrySet()) {
+                if (d.getValue() == null || d.getValue().isBlank()) continue;
+                session.run(
+                        "MATCH (n:KGNode {name: $name, sourceLabel: $label}) " +
+                        "WHERE n.description IS NULL SET n.description = $desc",
+                        Map.of("name", d.getKey(), "label", label, "desc", d.getValue()));
+            }
         }
+    }
+
+    // Creates a Chunk node in Neo4j and links it to its parent section via HAS_CHUNK.
+    // Returns the chunk's unique name so it can be used as the PostgreSQL embedding key.
+    private String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
+                                  String label, Session session) {
+        String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
+        String chunkId   = sectionTitle + "::chunk::" + chunkIdx;
+        session.run(String.format( // Neo4j
+                "MERGE (c:KGNode:`%s`:Chunk {name: $chunkId, sourceLabel: $label}) " +
+                "ON CREATE SET c.nodeType = 'chunk', c.text = $text, c.sectionTitle = $section",
+                safeLabel),
+                Map.of("chunkId", chunkId, "label", label, "text", chunkText, "section", sectionTitle));
+        session.run( // Neo4j — link section → chunk
+                "MATCH (s:KGNode {name: $section, sourceLabel: $label}) " +
+                "MATCH (c:KGNode {name: $chunkId,  sourceLabel: $label}) " +
+                "MERGE (s)-[:HAS_CHUNK]->(c)",
+                Map.of("section", sectionTitle, "chunkId", chunkId, "label", label));
+        return chunkId;
     }
 
     private List<String> uniqueNodeNames(List<Triple> triples) {
@@ -689,16 +800,29 @@ public class KnowledgeService {
 
     // ── Context builders ──────────────────────────────────────────────────────
 
-    // vector mode: no graph traversal — list seed node names ranked by similarity
-    private String buildVectorContextString(List<String> nodeNames, String label) {
-        if (nodeNames.isEmpty()) return "No semantically relevant nodes found for: " + label;
-        StringBuilder sb = new StringBuilder("Semantically relevant knowledge nodes for '")
-                .append(label).append("' (ranked by vector similarity):\n");
-        for (String name : nodeNames) sb.append("- ").append(name).append("\n");
+    // vector mode: format chunk passages and entity names from similarity search results
+    private String buildVectorContextFromMatches(List<BikeEmbedding> matches, String label) {
+        if (matches.isEmpty()) return "No semantically relevant content found for: " + label;
+        StringBuilder sb = new StringBuilder();
+        List<BikeEmbedding> chunks   = matches.stream()
+                .filter(m -> CHUNK_SOURCE_TYPE.equals(m.getSourceType())).toList();
+        List<BikeEmbedding> entities = matches.stream()
+                .filter(m -> !CHUNK_SOURCE_TYPE.equals(m.getSourceType())).toList();
+        if (!chunks.isEmpty()) {
+            sb.append("=== RELEVANT TEXT PASSAGES ===\n");
+            for (BikeEmbedding c : chunks) {
+                sb.append("[").append(c.getName()).append("]\n")
+                  .append(c.getTextContent()).append("\n\n");
+            }
+        }
+        if (!entities.isEmpty()) {
+            sb.append("=== RELEVANT KNOWLEDGE NODES ===\n");
+            for (BikeEmbedding e : entities) sb.append("- ").append(e.getName()).append("\n");
+        }
         return sb.toString();
     }
 
-    // graph mode: keyword-match node names in Neo4j, expand their relationships — no PostgreSQL
+    // graph mode: keyword-match node names in Neo4j, expand 1-hop + 2-hop — no PostgreSQL
     private List<Map<String, Object>> buildKeywordGraphContext(String question, String label,
                                                                int topK, int neighborLimit) {
         List<String> keywords = Arrays.stream(question.toLowerCase().split("\\W+"))
@@ -708,24 +832,58 @@ public class KnowledgeService {
         if (keywords.isEmpty()) return List.of();
 
         List<Map<String, Object>> context = new ArrayList<>();
+        Set<String> expanded    = new LinkedHashSet<>();
+        Set<String> twoHopSeeds = new LinkedHashSet<>();
+
         try (Session session = driver.session()) { // Neo4j
+            // 1-hop from keyword-matched nodes
             session.run(
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                    "coalesce(nb.text, '') AS neighborText " +
+                    "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                     "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit)
-            ).list().forEach(r -> context.add(Map.of(
-                    "node",         r.get("node").asString(""),
-                    "relationship", r.get("relType").asString(""),
-                    "neighbor",     r.get("neighborName").asString(""),
-                    "neighborText", r.get("neighborText").asString("")
-            )));
+            ).list().forEach(r -> {
+                String relType      = r.get("relType").asString("");
+                String nodeName     = r.get("node").asString("");
+                String neighborName = r.get("neighborName").asString("");
+                context.add(Map.of(
+                        "node",         nodeName,
+                        "relationship", relType,
+                        "neighbor",     neighborName,
+                        "neighborText", r.get("neighborText").asString(""),
+                        "neighborDesc", r.get("neighborDesc").asString("")
+                ));
+                expanded.add(nodeName);
+                if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
+                    twoHopSeeds.add(neighborName);
+            });
+
+            // 2-hop from entity neighbors
+            int twoHopLimit = Math.max(3, neighborLimit / 4);
+            for (String name : twoHopSeeds) {
+                if (!expanded.add(name)) continue;
+                session.run(
+                        "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
+                        "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
+                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
+                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "LIMIT $limit",
+                        Map.of("name", name, "label", label, "limit", twoHopLimit)
+                ).list().forEach(r -> context.add(Map.of(
+                        "node",         r.get("node").asString(""),
+                        "relationship", r.get("relType").asString(""),
+                        "neighbor",     r.get("neighborName").asString(""),
+                        "neighborText", "",
+                        "neighborDesc", r.get("neighborDesc").asString("")
+                )));
+            }
         } catch (Exception e) {
             context.add(Map.of("error", "Graph keyword search failed: " + e.getMessage()));
         }
+
         Set<String> seen = new LinkedHashSet<>();
         return context.stream()
                 .filter(e -> seen.add(
@@ -737,54 +895,140 @@ public class KnowledgeService {
 
     private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit) {
         List<Map<String, Object>> context = new ArrayList<>();
-        Set<String> expandedNodes = new HashSet<>();
+        Set<String> seedEntityNames = new LinkedHashSet<>();
+
+        // Pass 1 — collect chunk passages + resolve parent entities for chunk seeds
         try (Session session = driver.session()) { // Neo4j
             for (BikeEmbedding match : matches) {
-                if (!expandedNodes.add(match.getName())) continue;
+                if (CHUNK_SOURCE_TYPE.equals(match.getSourceType())) {
+                    String text = match.getTextContent();
+                    if (text != null && !text.isEmpty())
+                        context.add(Map.of("passage", text, "source", match.getName()));
+                    // Traverse chunk → section → entity to get a graph expansion seed
+                    session.run(
+                            "MATCH (c:KGNode {name: $name, sourceLabel: $label})" +
+                            "<-[:HAS_CHUNK]-(s:KGNode)<-[r]-(e:KGNode {sourceLabel: $label}) " +
+                            "WHERE NOT e.nodeType IN ['section','chunk'] " +
+                            "RETURN e.name AS entityName LIMIT 1",
+                            Map.of("name", match.getName(), "label", label)
+                    ).list().forEach(r -> {
+                        String en = r.get("entityName").asString("");
+                        if (!en.isEmpty()) seedEntityNames.add(en);
+                    });
+                } else {
+                    seedEntityNames.add(match.getName());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Chunk parent traversal failed: {}", e.getMessage());
+        }
+
+        // Pass 2 — 1-hop expand from seed entities, collect non-section neighbors for 2-hop
+        Set<String> expanded = new HashSet<>(seedEntityNames);
+        Set<String> twoHopSeeds = new LinkedHashSet<>();
+        try (Session session = driver.session()) { // Neo4j
+            for (String name : seedEntityNames) {
                 session.run(
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "coalesce(nb.text, '') AS neighborText " +
-                        // Entity-to-entity relationships (PARTICIPATED_IN, RELATED_TO, etc.) come first;
-                        // section sub-node links (HAS_*_INFO) are pushed to the end of the limit window.
+                        "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                         "LIMIT $limit",
-                        Map.of("name", match.getName(), "label", label, "limit", neighborLimit)
+                        Map.of("name", name, "label", label, "limit", neighborLimit)
+                ).list().forEach(r -> {
+                    String relType      = r.get("relType").asString("");
+                    String neighborName = r.get("neighborName").asString("");
+                    context.add(Map.of(
+                            "node",         r.get("node").asString(""),
+                            "relationship", relType,
+                            "neighbor",     neighborName,
+                            "neighborText", r.get("neighborText").asString(""),
+                            "neighborDesc", r.get("neighborDesc").asString("")
+                    ));
+                    if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
+                        twoHopSeeds.add(neighborName);
+                });
+            }
+        } catch (Exception e) {
+            context.add(Map.of("error", "Graph expansion failed: " + e.getMessage()));
+        }
+
+        // Pass 3 — 2-hop expand (entity-to-entity only, smaller limit)
+        int twoHopLimit = Math.max(3, neighborLimit / 4);
+        try (Session session = driver.session()) { // Neo4j
+            for (String name : twoHopSeeds) {
+                if (!expanded.add(name)) continue;
+                session.run(
+                        "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
+                        "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
+                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
+                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "LIMIT $limit",
+                        Map.of("name", name, "label", label, "limit", twoHopLimit)
                 ).list().forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
                         "relationship", r.get("relType").asString(""),
                         "neighbor",     r.get("neighborName").asString(""),
-                        "neighborText", r.get("neighborText").asString("")
+                        "neighborText", "",
+                        "neighborDesc", r.get("neighborDesc").asString("")
                 )));
             }
         } catch (Exception e) {
-            context.add(Map.of("error",
-                    "Graph expansion failed (Neo4j may be paused): " + e.getMessage()));
+            log.warn("2-hop expansion failed: {}", e.getMessage());
         }
+
         Set<String> seen = new LinkedHashSet<>();
         return context.stream()
-                .filter(e -> seen.add(
-                        e.getOrDefault("node", "") + "|" +
-                        e.getOrDefault("relationship", "") + "|" +
-                        e.getOrDefault("neighbor", "")))
+                .filter(e -> {
+                    if (e.containsKey("passage"))
+                        return seen.add("passage:" + e.getOrDefault("source", ""));
+                    return seen.add(
+                            e.getOrDefault("node", "") + "|" +
+                            e.getOrDefault("relationship", "") + "|" +
+                            e.getOrDefault("neighbor", ""));
+                })
                 .collect(Collectors.toList());
     }
 
     private String buildContextString(List<Map<String, Object>> context, String label) {
         if (context.isEmpty()) return "No relevant knowledge graph context found for: " + label;
-        StringBuilder sb = new StringBuilder("Knowledge graph context (").append(label).append("):\n");
-        for (Map<String, Object> e : context) {
-            if (e.containsKey("neighbor")) {
-                sb.append(String.format("- %s %s %s\n",
-                        e.get("node"), e.get("relationship"), e.get("neighbor")));
-                String text = (String) e.getOrDefault("neighborText", "");
-                if (text != null && !text.isEmpty()) {
-                    String snippet = text.length() > 500 ? text.substring(0, 500) + "..." : text;
+
+        List<Map<String, Object>> passages = context.stream().filter(e -> e.containsKey("passage")).toList();
+        List<Map<String, Object>> triplets = context.stream().filter(e -> e.containsKey("neighbor")).toList();
+
+        StringBuilder sb = new StringBuilder();
+
+        if (!passages.isEmpty()) {
+            sb.append("=== RELEVANT TEXT PASSAGES ===\n");
+            for (Map<String, Object> p : passages) {
+                sb.append("[").append(p.get("source")).append("]\n")
+                  .append(p.get("passage")).append("\n\n");
+            }
+        }
+
+        if (!triplets.isEmpty()) {
+            sb.append("=== KNOWLEDGE GRAPH RELATIONSHIPS (").append(label).append(") ===\n");
+            for (Map<String, Object> e : triplets) {
+                String desc         = (String) e.getOrDefault("neighborDesc", "");
+                String neighborText = (String) e.getOrDefault("neighborText", "");
+                String neighbor     = String.valueOf(e.get("neighbor"));
+
+                if (desc != null && !desc.isEmpty()) {
+                    sb.append(String.format("- %s %s %s (%s)\n",
+                            e.get("node"), e.get("relationship"), neighbor, desc));
+                } else {
+                    sb.append(String.format("- %s %s %s\n",
+                            e.get("node"), e.get("relationship"), neighbor));
+                }
+                if (neighborText != null && !neighborText.isEmpty()) {
+                    String snippet = neighborText.length() > 500
+                            ? neighborText.substring(0, 500) + "..." : neighborText;
                     sb.append("  [").append(snippet).append("]\n");
                 }
             }
         }
-        return sb.toString();
+
+        return sb.isEmpty() ? "No relevant knowledge graph context found for: " + label : sb.toString();
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────

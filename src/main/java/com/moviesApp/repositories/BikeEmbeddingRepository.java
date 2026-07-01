@@ -35,7 +35,7 @@ public interface BikeEmbeddingRepository extends JpaRepository<BikeEmbedding, Lo
             @Param("k") int k
     );
 
-    // Knowledge graph node similarity search filtered by label
+    // Knowledge graph node similarity search filtered by label (entity names only)
     @Query(value =
         "SELECT * FROM bike_embeddings " +
         "WHERE source_type = 'knowledge_node' AND labels = :label " +
@@ -48,9 +48,28 @@ public interface BikeEmbeddingRepository extends JpaRepository<BikeEmbedding, Lo
             @Param("k") int k
     );
 
+    // Search both entity names (knowledge_node) and chunk text (chunk_text) for a label
+    @Query(value =
+        "SELECT * FROM bike_embeddings " +
+        "WHERE source_type IN ('knowledge_node', 'chunk_text') AND labels = :label " +
+        "ORDER BY (embedding_json::vector <=> CAST(:queryVector AS vector)) " +
+        "LIMIT :k",
+        nativeQuery = true)
+    List<BikeEmbedding> findSimilarAllTypesByLabel(
+            @Param("queryVector") String queryVector,
+            @Param("label") String label,
+            @Param("k") int k
+    );
+
     @Modifying
     @Transactional
     void deleteBySourceTypeAndLabels(String sourceType, String labels);
+
+    // Delete all embeddings for a label regardless of source type
+    @Modifying
+    @Transactional
+    @Query(value = "DELETE FROM bike_embeddings WHERE labels = :labels", nativeQuery = true)
+    void deleteAllByLabels(@Param("labels") String labels);
 
     @Modifying
     @Transactional
