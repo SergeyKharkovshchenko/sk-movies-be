@@ -437,22 +437,46 @@ public class KnowledgeService {
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens,
-                                    int topK, int neighborLimit) throws Exception {
-        int effectiveTopK          = topK > 0          ? topK          : TOP_K;
-        int effectiveNeighborLimit = neighborLimit > 0  ? neighborLimit : NEIGHBOR_LIMIT;
+                                    int topK, int neighborLimit, String ragMode) throws Exception {
+        int effectiveTopK          = topK > 0         ? topK         : TOP_K;
+        int effectiveNeighborLimit = neighborLimit > 0 ? neighborLimit : NEIGHBOR_LIMIT;
 
-        // Embed the question into the same 1024-dim vector space Jina used during indexing.
-        // Then run a cosine-distance search (pgvector <=> operator) against every stored node
-        // embedding for this label — returns the TOP_K node names whose meaning is semantically
-        // closest to the question. "Closest" = smallest angle between vectors in embedding space,
-        // not keyword overlap. E.g. "who led the French forces?" matches "Napoleon" even if the
-        // word "led" never appeared in the indexed text.
-        float[] vec = jina.embed(List.of(question)).get(0);
-        List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
-                floatArrayToVectorString(vec), label, effectiveTopK);
+        List<Map<String, Object>> graphContext;
+        List<String>              seedNodes;
+        String                    contextText;
 
-        List<Map<String, Object>> graphContext = buildGraphContext(matches, label, effectiveNeighborLimit);
-        String contextText = buildContextString(graphContext, label);
+        if ("vector".equals(ragMode)) {
+            // PostgreSQL only — embed question, cosine-search node names, skip Neo4j entirely
+            float[] vec = jina.embed(List.of(question)).get(0);
+            List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
+                    floatArrayToVectorString(vec), label, effectiveTopK);
+            seedNodes    = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
+            graphContext = List.of();
+            contextText  = buildVectorContextString(seedNodes, label);
+
+        } else if ("graph".equals(ragMode)) {
+            // Neo4j only — keyword-match node names, expand relationships, skip PostgreSQL
+            graphContext = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit);
+            seedNodes    = graphContext.stream()
+                    .map(e -> (String) e.getOrDefault("node", ""))
+                    .distinct().filter(s -> !s.isEmpty()).collect(Collectors.toList());
+            contextText  = buildContextString(graphContext, label);
+
+        } else {
+            // combined (default) — vector seeds from PostgreSQL + graph expansion from Neo4j
+            // Embed the question into the same 1024-dim vector space Jina used during indexing.
+            // Then run a cosine-distance search (pgvector <=> operator) against every stored node
+            // embedding for this label — returns the TOP_K node names whose meaning is semantically
+            // closest to the question. "Closest" = smallest angle between vectors in embedding space,
+            // not keyword overlap. E.g. "who led the French forces?" matches "Napoleon" even if the
+            // word "led" never appeared in the indexed text.
+            float[] vec = jina.embed(List.of(question)).get(0);
+            List<BikeEmbedding> matches = repository.findSimilarByLabel( // PostgreSQL
+                    floatArrayToVectorString(vec), label, effectiveTopK);
+            seedNodes    = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
+            graphContext = buildGraphContext(matches, label, effectiveNeighborLimit);
+            contextText  = buildContextString(graphContext, label);
+        }
 
         List<Map<String, String>> messages = new ArrayList<>(history);
         messages.add(0, Map.of("role", "system", "content",
@@ -466,18 +490,17 @@ public class KnowledgeService {
                 messages
         );
 
-        List<String> seedNodes = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
-
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("answer",       answer);
         result.put("label",        label);
         result.put("question",     question);
         result.put("graphContext", graphContext);
         result.put("retrievalInfo", Map.of(
-                "seedNodes",      seedNodes,
+                "mode",            ragMode,
+                "seedNodes",       seedNodes,
                 "contextTriplets", graphContext.size(),
-                "topK",           effectiveTopK,
-                "neighborLimit",  effectiveNeighborLimit
+                "topK",            effectiveTopK,
+                "neighborLimit",   effectiveNeighborLimit
         ));
         return result;
     }
@@ -630,6 +653,49 @@ public class KnowledgeService {
     }
 
     // ── Context builders ──────────────────────────────────────────────────────
+
+    // vector mode: no graph traversal — list seed node names ranked by similarity
+    private String buildVectorContextString(List<String> nodeNames, String label) {
+        if (nodeNames.isEmpty()) return "No semantically relevant nodes found for: " + label;
+        StringBuilder sb = new StringBuilder("Semantically relevant knowledge nodes for '")
+                .append(label).append("' (ranked by vector similarity):\n");
+        for (String name : nodeNames) sb.append("- ").append(name).append("\n");
+        return sb.toString();
+    }
+
+    // graph mode: keyword-match node names in Neo4j, expand their relationships — no PostgreSQL
+    private List<Map<String, Object>> buildKeywordGraphContext(String question, String label,
+                                                               int topK, int neighborLimit) {
+        List<String> keywords = Arrays.stream(question.toLowerCase().split("\\W+"))
+                .filter(w -> w.length() > 3)
+                .distinct()
+                .collect(Collectors.toList());
+        if (keywords.isEmpty()) return List.of();
+
+        List<Map<String, Object>> context = new ArrayList<>();
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
+                    "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
+                    "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName " +
+                    "LIMIT $limit",
+                    Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit)
+            ).list().forEach(r -> context.add(Map.of(
+                    "node",         r.get("node").asString(""),
+                    "relationship", r.get("relType").asString(""),
+                    "neighbor",     r.get("neighborName").asString("")
+            )));
+        } catch (Exception e) {
+            context.add(Map.of("error", "Graph keyword search failed: " + e.getMessage()));
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        return context.stream()
+                .filter(e -> seen.add(
+                        e.getOrDefault("node", "") + "|" +
+                        e.getOrDefault("relationship", "") + "|" +
+                        e.getOrDefault("neighbor", "")))
+                .collect(Collectors.toList());
+    }
 
     private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit) {
         List<Map<String, Object>> context = new ArrayList<>();

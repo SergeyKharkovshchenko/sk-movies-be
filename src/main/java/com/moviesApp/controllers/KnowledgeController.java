@@ -157,9 +157,10 @@ public class KnowledgeController {
             int    maxTokens     = body.containsKey("maxTokens")     ? ((Number) body.get("maxTokens")).intValue()         : 800;
             int    topK          = body.containsKey("topK")          ? ((Number) body.get("topK")).intValue()              : 0;
             int    neighborLimit = body.containsKey("neighborLimit") ? ((Number) body.get("neighborLimit")).intValue()     : 0;
+            String ragMode       = String.valueOf(body.getOrDefault("ragMode", "combined"));
 
             return ResponseEntity.ok(
-                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit));
+                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit, ragMode));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
