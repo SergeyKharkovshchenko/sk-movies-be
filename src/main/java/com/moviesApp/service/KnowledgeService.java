@@ -117,9 +117,16 @@ public class KnowledgeService {
             }
 
             ENTITIES — extract every named entity:
-            - Include EVERY named person, place, event, organization, and key concept in the text
+            - Include EVERY named person, place, event, organization, key concept, cause, and outcome in the text
             - Use the exact name as it appears in the text (1-5 words)
-            - Types: Person, Event, Place, Organization, Concept
+            - Types:
+                Person       — named individual (Napoleon, Wellington)
+                Event        — named occurrence (Battle of Waterloo, Congress of Vienna)
+                Place        — named location (Brussels, Hougoumont)
+                Organization — named group or body (Prussian Army, Seventh Coalition)
+                Concept      — abstract idea or period (Pax Britannica, Hundred Days)
+                Reason       — a cause or motivation behind an event (Napoleon's Return, Coalition Mobilization)
+                Consequence  — an outcome or result of an event (Napoleon's Abdication, End of French Empire)
 
             SECTIONS — assign ALL source text verbatim:
             - Copy sentences VERBATIM from the source — never paraphrase, summarize, or rewrite
