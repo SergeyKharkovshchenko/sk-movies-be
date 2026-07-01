@@ -97,7 +97,7 @@ public class KnowledgeService {
     // ── Suggest graph ─────────────────────────────────────────────────────────
 
     private static final String GRAPH_DESIGN_PROMPT = """
-            You are a knowledge graph designer. Analyze the text and design a structured knowledge graph.
+            You are a knowledge graph designer. Extract a COMPREHENSIVE knowledge graph from the provided text.
             Return ONLY a valid JSON object — no markdown, no explanation:
             {
               "entities": [
@@ -107,24 +107,39 @@ public class KnowledgeService {
                 {
                   "title": "Section Title",
                   "forEntity": "Entity Name",
-                  "sectionRelationship": "HAS_TOPIC_INFO",
-                  "text": "The exact text content of this section..."
+                  "sectionRelationship": "HAS_<TOPIC>_INFO",
+                  "text": "Verbatim sentences from the source text..."
                 }
               ],
               "entityRelationships": [
                 { "from": "Entity A", "predicate": "RELATIONSHIP_TYPE", "to": "Entity B" }
               ]
             }
-            Rules:
-            - Entity names are exact proper nouns (1-4 words)
-            - Entity type is one of: Person, Event, Place, Organization, Concept
-            - Every section is assigned to exactly one entity via forEntity
-            - sectionRelationship must follow HAS_<TOPIC>_INFO pattern in UPPERCASE_SNAKE_CASE
-              (e.g. HAS_CAREER_INFO, HAS_GENERAL_INFO, HAS_DEATH_INFO, HAS_EDUCATION_INFO)
-            - ALL original text must appear in sections — assign every sentence to exactly one section
-            - Entity relationship predicates use UPPERCASE_SNAKE_CASE
-              (e.g. RELATED_TO, PARTICIPATED_IN, LED, MARRIED_TO, ALLY_OF, ENEMY_OF)
-            - Only create entityRelationships between entities that are explicitly connected in the text
+
+            ENTITIES — extract every named entity:
+            - Include EVERY named person, place, event, organization, and key concept in the text
+            - Use the exact name as it appears in the text (1-5 words)
+            - Types: Person, Event, Place, Organization, Concept
+
+            SECTIONS — assign ALL source text verbatim:
+            - Copy sentences VERBATIM from the source — never paraphrase, summarize, or rewrite
+            - Every sentence in the source must appear in exactly one section
+            - Group related sentences under one section title for their most relevant entity
+            - Use specific sectionRelationship types in UPPERCASE_SNAKE_CASE, for example:
+              HAS_BACKGROUND_INFO, HAS_MILITARY_INFO, HAS_OUTCOME_INFO, HAS_LOCATION_INFO,
+              HAS_ROLE_INFO, HAS_CAUSE_INFO, HAS_COMPOSITION_INFO, HAS_TIMELINE_INFO
+              Prefer specific types over the generic HAS_TOPIC_INFO
+
+            ENTITY RELATIONSHIPS — be exhaustive:
+            - Extract EVERY connection between entities mentioned in the text
+            - Causal/reason: CAUSED, LED_TO, RESULTED_IN, TRIGGERED, ENABLED, PREVENTED, REASON_FOR
+            - Temporal: PRECEDED, FOLLOWED
+            - Participation: PARTICIPATED_IN, COMMANDED, DEFEATED, FOUGHT_AGAINST
+            - Alliance/opposition: ALLIED_WITH, ENEMY_OF, OPPOSED
+            - Structural: PART_OF, LOCATED_IN, MEMBER_OF
+            - General: RELATED_TO
+            - Only use relationships directly supported by the source text — no invented connections
+            - Aim for maximum coverage: every entity pair that interacts should have at least one relationship
             """;
 
     @Cacheable("suggestGraph")
