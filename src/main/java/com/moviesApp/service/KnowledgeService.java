@@ -712,6 +712,7 @@ public class KnowledgeService {
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName " +
+                    "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit)
             ).list().forEach(r -> context.add(Map.of(
@@ -739,7 +740,11 @@ public class KnowledgeService {
                 if (!expandedNodes.add(match.getName())) continue;
                 session.run(
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
-                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName LIMIT $limit",
+                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName " +
+                        // Entity-to-entity relationships (PARTICIPATED_IN, RELATED_TO, etc.) come first;
+                        // section sub-node links (HAS_*_INFO) are pushed to the end of the limit window.
+                        "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
+                        "LIMIT $limit",
                         Map.of("name", match.getName(), "label", label, "limit", neighborLimit)
                 ).list().forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
