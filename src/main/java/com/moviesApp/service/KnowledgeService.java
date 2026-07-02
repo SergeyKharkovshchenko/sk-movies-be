@@ -128,10 +128,13 @@ public class KnowledgeService {
                 Reason       — a cause or motivation behind an event (Napoleon's Return, Coalition Mobilization)
                 Consequence  — an outcome or result of an event (Napoleon's Abdication, End of French Empire)
 
-            SECTIONS — assign ALL source text verbatim:
-            - Copy sentences VERBATIM from the source — never paraphrase, summarize, or rewrite
-            - Every sentence in the source must appear in exactly one section
-            - Group related sentences under one section title for their most relevant entity
+            SECTIONS — partition the ENTIRE source text, sentence by sentence:
+            - Think of this as a PARTITION operation, not an extraction. Every single sentence
+              from the source must land in exactly one section — none may be skipped or omitted.
+            - Copy each sentence VERBATIM — never paraphrase, summarize, or shorten.
+            - Work through the source top-to-bottom and assign each sentence to the most
+              relevant section. A section with only 1–2 sentences is a sign you skipped something.
+            - Aim for sections of 5–10+ sentences. Merge thin topics rather than creating stubs.
             - Use specific sectionRelationship types in UPPERCASE_SNAKE_CASE, for example:
               HAS_BACKGROUND_INFO, HAS_MILITARY_INFO, HAS_OUTCOME_INFO, HAS_LOCATION_INFO,
               HAS_ROLE_INFO, HAS_CAUSE_INFO, HAS_COMPOSITION_INFO, HAS_TIMELINE_INFO
