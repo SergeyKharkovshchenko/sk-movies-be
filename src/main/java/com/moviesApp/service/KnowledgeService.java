@@ -101,7 +101,7 @@ public class KnowledgeService {
             Return ONLY a valid JSON object — no markdown, no explanation:
             {
               "entities": [
-                { "name": "Entity Name", "type": "Person|Event|Place|Organization|Concept" }
+                { "name": "Entity Name", "type": "Person|Event|Place|Organization|Concept|Reason|Consequence" }
               ],
               "sections": [
                 {
