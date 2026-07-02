@@ -208,6 +208,11 @@ public class KnowledgeService {
                 Set<String> seenTripleKeys = new LinkedHashSet<>();
                 int totalTriples = 0;
 
+                List<String> canonicalNames = entities.stream()
+                        .map(e -> e.get("name"))
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+
                 for (int si = 0; si < totalSections; si++) {
                     Map<String, String> sec = sections.get(si);
                     String sectionTitle        = sec.getOrDefault("title", "section_" + (si + 1));
@@ -251,7 +256,7 @@ public class KnowledgeService {
                             chunkIds.add(chunkId);
                             chunkTexts.add(chunkText);
 
-                            ExtractionResult extracted = extractor.extract(chunkText);
+                            ExtractionResult extracted = extractor.extract(chunkText, canonicalNames);
                             for (Triple t : extracted.triples()) {
                                 if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
                                     sectionTriples.add(t);

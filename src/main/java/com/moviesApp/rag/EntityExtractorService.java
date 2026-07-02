@@ -52,8 +52,16 @@ public class EntityExtractorService {
     }
 
     public ExtractionResult extract(String text) {
+        return extract(text, List.of());
+    }
+
+    public ExtractionResult extract(String text, List<String> canonicalNames) {
+        String prompt = canonicalNames.isEmpty() ? SYSTEM_PROMPT : SYSTEM_PROMPT +
+                "\nCANONICAL ENTITY NAMES — when any of these entities appear in the text, " +
+                "use this EXACT spelling (do not paraphrase, abbreviate, or expand):\n" +
+                String.join(", ", canonicalNames);
         try {
-            String response = openAi.chat(SYSTEM_PROMPT, text).strip();
+            String response = openAi.chat(prompt, text).strip();
             if (response.startsWith("```")) {
                 response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
             }
