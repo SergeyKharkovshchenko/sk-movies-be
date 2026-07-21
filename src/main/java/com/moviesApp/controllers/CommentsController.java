@@ -1,7 +1,7 @@
 package com.moviesApp.controllers;
 
+import com.moviesApp.messaging.CommentEventPublisher;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
@@ -10,28 +10,35 @@ import org.springframework.beans.factory.annotation.Autowired;
 import com.moviesApp.entities.Comment;
 import com.moviesApp.service.CommentsService;
 
+import java.util.List;
+
 @RestController
 public class CommentsController {
 
     @Autowired
     private CommentsService commentsService;
 
+    @Autowired
+    private CommentEventPublisher commentEventPublisher;
+
     @GetMapping("/getAllComments")
-    public ResponseEntity<Iterable<Comment>> getAllUsers() {
-        Iterable<Comment> users = commentsService.getAllComments();
-        return ResponseEntity.ok(users);
+    public ResponseEntity<List<Comment>> getAllUsers() {
+        List<Comment> comments = commentsService.getAllComments();
+        commentEventPublisher.publish("/getAllComments", "all", comments);
+        return ResponseEntity.ok(comments);
     }
 
     @GetMapping("/comments/movie/{movieId}")
-    public ResponseEntity<Iterable<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
-        Iterable<Comment> comments = commentsService.getCommentsByMovieId(movieId);
+    public ResponseEntity<List<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
+        List<Comment> comments = commentsService.getCommentsByMovieId(movieId);
+        commentEventPublisher.publish("/comments/movie", movieId, comments);
         return ResponseEntity.ok(comments);
     }
 
     @GetMapping("/comments/user/{userId}")
-    public ResponseEntity<Iterable<Comment>> getCommentsByUserId(@PathVariable String userId) {
-        Iterable<Comment> comments = commentsService.getCommentsByUserId(userId);
+    public ResponseEntity<List<Comment>> getCommentsByUserId(@PathVariable String userId) {
+        List<Comment> comments = commentsService.getCommentsByUserId(userId);
+        commentEventPublisher.publish("/comments/user", userId, comments);
         return ResponseEntity.ok(comments);
     }
-
 }
