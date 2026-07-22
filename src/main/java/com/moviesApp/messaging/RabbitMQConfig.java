@@ -11,28 +11,9 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class RabbitMQConfig {
 
-    public static final String QUEUE    = "comments.queue";
-    public static final String EXCHANGE = "comments.exchange";
-    public static final String KEY      = "comments";
-
     public static final String POSTER_QUEUE    = "posters.queue";
     public static final String POSTER_EXCHANGE = "posters.exchange";
     public static final String POSTER_KEY      = "posters.generate";
-
-    @Bean
-    public Queue commentsQueue() {
-        return QueueBuilder.durable(QUEUE).build();
-    }
-
-    @Bean
-    public DirectExchange commentsExchange() {
-        return new DirectExchange(EXCHANGE);
-    }
-
-    @Bean
-    public Binding commentsBinding(Queue commentsQueue, DirectExchange commentsExchange) {
-        return BindingBuilder.bind(commentsQueue).to(commentsExchange).with(KEY);
-    }
 
     @Bean
     public Queue postersQueue() {
