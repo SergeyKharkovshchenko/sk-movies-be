@@ -11,23 +11,23 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class RabbitMQConfig {
 
-    public static final String QUEUE    = "comments.queue";
-    public static final String EXCHANGE = "comments.exchange";
-    public static final String KEY      = "comments";
+    public static final String POSTER_QUEUE    = "posters.queue";
+    public static final String POSTER_EXCHANGE = "posters.exchange";
+    public static final String POSTER_KEY      = "posters.generate";
 
     @Bean
-    public Queue commentsQueue() {
-        return QueueBuilder.durable(QUEUE).build();
+    public Queue postersQueue() {
+        return QueueBuilder.durable(POSTER_QUEUE).build();
     }
 
     @Bean
-    public DirectExchange commentsExchange() {
-        return new DirectExchange(EXCHANGE);
+    public DirectExchange postersExchange() {
+        return new DirectExchange(POSTER_EXCHANGE);
     }
 
     @Bean
-    public Binding commentsBinding(Queue commentsQueue, DirectExchange commentsExchange) {
-        return BindingBuilder.bind(commentsQueue).to(commentsExchange).with(KEY);
+    public Binding postersBinding(Queue postersQueue, DirectExchange postersExchange) {
+        return BindingBuilder.bind(postersQueue).to(postersExchange).with(POSTER_KEY);
     }
 
     @Bean

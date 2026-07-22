@@ -43,6 +43,9 @@ public class PosterController {
     public ResponseEntity<Map<String, Object>> getPosterEmbedding(@PathVariable String movieId) {
         try {
             Map<String, Object> result = posterEmbeddingService.getOrCreatePosterEmbedding(movieId);
+            if ("queued".equals(result.get("status"))) {
+                return ResponseEntity.accepted().body(result);
+            }
             return ResponseEntity.ok(result);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
