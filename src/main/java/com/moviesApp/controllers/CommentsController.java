@@ -1,6 +1,5 @@
 package com.moviesApp.controllers;
 
-import com.moviesApp.messaging.CommentEventPublisher;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -18,27 +17,21 @@ public class CommentsController {
     @Autowired
     private CommentsService commentsService;
 
-    @Autowired
-    private CommentEventPublisher commentEventPublisher;
-
     @GetMapping("/getAllComments")
     public ResponseEntity<List<Comment>> getAllUsers() {
         List<Comment> comments = commentsService.getAllComments();
-        commentEventPublisher.publish("/getAllComments", "all", comments);
         return ResponseEntity.ok(comments);
     }
 
     @GetMapping("/comments/movie/{movieId}")
     public ResponseEntity<List<Comment>> getCommentsByMovieId(@PathVariable String movieId) {
         List<Comment> comments = commentsService.getCommentsByMovieId(movieId);
-        commentEventPublisher.publish("/comments/movie", movieId, comments);
         return ResponseEntity.ok(comments);
     }
 
     @GetMapping("/comments/user/{userId}")
     public ResponseEntity<List<Comment>> getCommentsByUserId(@PathVariable String userId) {
         List<Comment> comments = commentsService.getCommentsByUserId(userId);
-        commentEventPublisher.publish("/comments/user", userId, comments);
         return ResponseEntity.ok(comments);
     }
 }

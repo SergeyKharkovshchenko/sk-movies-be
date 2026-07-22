@@ -2,6 +2,7 @@ package com.moviesApp.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moviesApp.entities.MoviePosterEmbedding;
+import com.moviesApp.messaging.PosterEmbeddingJobPublisher;
 import com.moviesApp.repositories.MoviePosterEmbeddingRepository;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -22,6 +23,7 @@ import java.util.Optional;
 public class PosterEmbeddingService {
 
     private final MoviePosterEmbeddingRepository repository;
+    private final PosterEmbeddingJobPublisher jobPublisher;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
@@ -31,8 +33,9 @@ public class PosterEmbeddingService {
     @Value("${JINA_API_KEY}")
     private String jinaApiKey;
 
-    public PosterEmbeddingService(MoviePosterEmbeddingRepository repository) {
+    public PosterEmbeddingService(MoviePosterEmbeddingRepository repository, PosterEmbeddingJobPublisher jobPublisher) {
         this.repository = repository;
+        this.jobPublisher = jobPublisher;
     }
 
     public Map<String, Object> getOrCreatePosterEmbedding(String movieId) throws Exception {
@@ -54,11 +57,24 @@ public class PosterEmbeddingService {
                 : fetchMovieInfo(movieId);
         String posterUrl = movieInfo[0];
         String movieTitle = movieInfo[1];
+
+        jobPublisher.publish(movieId, movieTitle, posterUrl);
+
+        return Map.of(
+                "movieId", movieId,
+                "movieTitle", movieTitle != null ? movieTitle : "",
+                "posterUrl", posterUrl,
+                "status", "queued",
+                "cached", false);
+    }
+
+    // Invoked by PosterEmbeddingJobConsumer to do the slow work (image download + Jina call) off the request thread.
+    public void processPosterEmbeddingJob(String movieId, String movieTitle, String posterUrl) throws Exception {
         String base64Image = downloadImageAsBase64(posterUrl);
         List<Double> embedding = embedImage(base64Image);
         String embeddingJson = objectMapper.writeValueAsString(embedding);
 
-        MoviePosterEmbedding record = existing.orElse(new MoviePosterEmbedding());
+        MoviePosterEmbedding record = repository.findById(movieId).orElse(new MoviePosterEmbedding());
         record.setMovieId(movieId);
         record.setPosterUrl(posterUrl);
         record.setMovieTitle(movieTitle);
@@ -66,13 +82,6 @@ public class PosterEmbeddingService {
         record.setImageBase64(base64Image);
         record.setCreatedAt(LocalDateTime.now());
         repository.save(record);
-
-        return Map.of(
-                "movieId", movieId,
-                "movieTitle", movieTitle != null ? movieTitle : "",
-                "posterUrl", posterUrl,
-                "embeddingDim", embedding.size(),
-                "cached", false);
     }
 
     // returns [posterUrl, movieTitle]
