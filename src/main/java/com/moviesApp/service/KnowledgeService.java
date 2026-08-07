@@ -120,13 +120,34 @@ public class KnowledgeService {
             - Include EVERY named person, place, event, organization, key concept, cause, and outcome in the text
             - Use the exact name as it appears in the text (1-5 words)
             - Types:
-                Person       — named individual (Napoleon, Wellington)
-                Event        — named occurrence (Battle of Waterloo, Congress of Vienna)
-                Place        — named location (Brussels, Hougoumont)
-                Organization — named group or body (Prussian Army, Seventh Coalition)
-                Concept      — abstract idea or period (Pax Britannica, Hundred Days)
+                Person       — named individual (Napoleon, Wellington, Anna, Tom)
+                Event        — a specific, dated/scheduled happening — something that occurs, not a bare
+                               time or day value (Battle of Waterloo, Congress of Vienna). A clock time or
+                               a day-of-week alone is never an Event — see Concept below.
+                Place        — any named physical location or venue, including businesses and venues
+                               someone visits or stays at (Brussels, Hougoumont, Hotel Atlas, Bavarian
+                               Bistro, Deutsches Museum, Munich Hbf). A hotel, restaurant, museum, or
+                               station is a Place, not an Organization — you go there, it's a location.
+                Organization — a named group, institution, or body that acts collectively, not a venue
+                               (Prussian Army, Seventh Coalition, a company as an institution). If the
+                               entity is somewhere you can physically visit, it's a Place instead.
+                Concept      — abstract idea, period, preference, constraint, goal, or a standalone
+                               time/date/day value that isn't itself a discrete happening (Pax Britannica,
+                               Hundred Days, vegetarian options, easy plan, Saturday, 10:20). Bare clock
+                               times and day names always go here, never under Event or Organization.
                 Reason       — a cause or motivation behind an event (Napoleon's Return, Coalition Mobilization)
                 Consequence  — an outcome or result of an event (Napoleon's Abdication, End of French Empire)
+
+              Common mistakes to avoid:
+                - Hotel / restaurant / museum / station names → Place, never Organization.
+                - A clock time (10:20) or day-of-week/date (Saturday) → Concept, never Event or Organization.
+                - A preference, requirement, or goal (vegetarian options, easy plan, cheapest option) → Concept.
+                - Never fold a composite fact into one long, text-like entity name (e.g. "train arriving at
+                  10:20" or "return train leaving at 18:40"). Split it instead: create a dedicated Event
+                  entity for the booking/leg/appointment itself (e.g. "Outbound Train", "Return Train"), and
+                  a separate Concept entity for the bare time (10:20, 18:40), then connect the two with a
+                  specific relationship (see ARRIVES_AT / DEPARTS_AT below). A relationship target should
+                  read like a name, never like a sentence fragment.
 
             SECTIONS — partition the ENTIRE source text, sentence by sentence:
             - Think of this as a PARTITION operation, not an extraction. Every single sentence
@@ -142,14 +163,48 @@ public class KnowledgeService {
 
             ENTITY RELATIONSHIPS — be exhaustive:
             - Extract EVERY connection between entities mentioned in the text
-            - Causal/reason: CAUSED, LED_TO, RESULTED_IN, TRIGGERED, ENABLED, PREVENTED, REASON_FOR
+            - Causal/reason: CAUSED, LED_TO, RESULTED_IN, TRIGGERED, PREVENTED, REASON_FOR
+              (ENABLED/ENABLES and other reasoned-benefit predicates are always POSSIBLE_-prefixed — see
+              DEEP ANALYSIS below, never used bare here)
             - Temporal: PRECEDED, FOLLOWED
             - Participation: PARTICIPATED_IN, COMMANDED, DEFEATED, FOUGHT_AGAINST
             - Alliance/opposition: ALLIED_WITH, ENEMY_OF, OPPOSED
             - Structural: PART_OF, LOCATED_IN, MEMBER_OF
+            - Location/distance: LOCATED_NEAR, LOCATED_FAR_FROM
+            - Preference/requirement: WANTS, PREFERS, HAS_DIETARY_REQUIREMENT, HAS_DIETARY_OPTIONS, REQUIRES
+            - Logistics/scheduling: TRAVELS_WITH, PLANS_TRIP_TO, BOOKED, OPEN_ON, CLOSED_ON, ARRIVES_AT,
+              DEPARTS_AT, SCHEDULED_FOR
             - General: RELATED_TO
-            - Only use relationships directly supported by the source text — no invented connections
+            - Prefer the most specific predicate that fits (e.g. HAS_DIETARY_REQUIREMENT over RELATED_TO
+              for "Tom is vegetarian") — these lists are a starting vocabulary, not exhaustive; introduce a
+              new well-named UPPERCASE_SNAKE_CASE predicate when nothing above fits the relationship
+            - BOOKED (and similar logistics predicates) must point at a dedicated entity (the booking/leg
+              itself, e.g. "Outbound Train"), never at a composite phrase — attach the time to that entity
+              separately via ARRIVES_AT / DEPARTS_AT / SCHEDULED_FOR, per the ENTITIES rule above
+            - Use these predicates as-is for connections directly stated or unambiguously implied by the
+              source text — no invented connections at this stage
             - Aim for maximum coverage: every entity pair that interacts should have at least one relationship
+
+            DEEP ANALYSIS — go beyond what the text says outright:
+            - After extracting the direct relationships above, re-read the text as an analyst and reason
+              about causal chains, motivations, and outcomes the text implies but never states plainly —
+              e.g. an underlying motive behind a decision, a downstream effect the text doesn't spell out,
+              or a connection between two events/entities that only becomes visible when you consider the
+              text as a whole.
+            - Express each such reasoned connection as a normal entityRelationships entry — same
+              "from"/"predicate"/"to" shape — but PREFIX the predicate with "POSSIBLE_", e.g.
+              POSSIBLE_CAUSED, POSSIBLE_LED_TO, POSSIBLE_REASON_FOR, POSSIBLE_RESULTED_IN. This is how an
+              inferred connection is distinguished from one the source text actually states — never emit a
+              bare (non-prefixed) predicate for something you reasoned into existence rather than read.
+            - Do not fabricate connections between unrelated entities — every POSSIBLE_ relationship must be
+              a reasonable, defensible reading of the text, not a guess.
+            - Do not add a POSSIBLE_ duplicate of a relationship already captured as a direct one.
+            - Reasoned-benefit predicates ALWAYS take the POSSIBLE_ prefix — this is not optional: ENABLES,
+              ALLOWS, MAKES_POSSIBLE, JUSTIFIES (and similar) express a judgment about why a choice is good
+              or what it makes achievable. Even when the underlying facts are stated in an explicit
+              conditional sentence ("If they choose X, they can do Y"), turning that into "X ENABLES Y" is
+              you synthesizing a causal/evaluative claim, not quoting one — so it is always
+              POSSIBLE_ENABLES, POSSIBLE_ALLOWS, etc., never a bare ENABLES.
             """;
 
     @Cacheable("suggestGraph")
@@ -609,6 +664,19 @@ public class KnowledgeService {
             contextText = buildContextString(graphContext, label);
         }
 
+        // Relationships whose predicate is prefixed POSSIBLE_ (e.g. POSSIBLE_CAUSED, POSSIBLE_REASON_FOR)
+        // are inferred connections the extractor reasoned out, not sentences taken verbatim from the
+        // source. Both modes are told how to handle that distinction — strict mode may state them but
+        // must label them as inferred; default mode may also add its own reasoning under the same label.
+        String possibleRelHandling =
+                "Some relationships in the context have a predicate starting with 'POSSIBLE_' " +
+                "(e.g. POSSIBLE_CAUSED, POSSIBLE_REASON_FOR). These are inferred connections, not " +
+                "statements taken verbatim from the source text. When your answer relies on one of them, " +
+                "present it separately from directly-stated facts and label it clearly, e.g. " +
+                "'Possible reason (inferred, not explicitly stated): ...' or " +
+                "'Possible consequence (inferred, not explicitly stated): ...'. Never present an inferred " +
+                "connection as if the source text stated it outright.";
+
         // strict=true: model must answer only from context, no pre-training knowledge allowed.
         // strict=false (default): model may supplement with general knowledge when context is thin.
         String systemPrompt = strict
@@ -617,9 +685,14 @@ public class KnowledgeService {
                   "Do not add background, explanation, or any information not explicitly present in the context. " +
                   "Do not say 'however' or 'historically' or reference any outside knowledge. " +
                   "If the answer cannot be found in the context, output exactly this and nothing else: " +
-                  "'Not in knowledge base.'\n\nContext:\n" + contextText
+                  "'Not in knowledge base.' " + possibleRelHandling + "\n\nContext:\n" + contextText
                 : "You are a knowledgeable assistant. Use the following knowledge graph context to answer accurately. " +
-                  "If the answer is not in the context, say so honestly.\n\nContext:\n" + contextText;
+                  "If the answer is not in the context, say so honestly. " +
+                  "You may also go beyond what's directly stated and reason out likely reasons, causes, or " +
+                  "consequences that the context strongly implies but doesn't say outright — as long as you " +
+                  "clearly label any such reasoning as a possible/inferred conclusion, separate from stated facts, " +
+                  "the same way you would label a POSSIBLE_ relationship. " + possibleRelHandling +
+                  "\n\nContext:\n" + contextText;
 
         double effectiveTemperature = temperature > 0 ? temperature : 0.7;
 
