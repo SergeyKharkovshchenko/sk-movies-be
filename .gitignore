@@ -32,3 +32,6 @@ build/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Google Cloud service account key (structured logging) — never commit
+credentials.json
