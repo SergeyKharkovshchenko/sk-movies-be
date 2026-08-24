@@ -17,6 +17,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -100,6 +101,30 @@ public class LoggingService {
         executor.submit(() -> writeEntry(payload));
     }
 
+    /**
+     * Synchronous write for the /test-gcp-logging diagnostic endpoint — unlike
+     * {@link #logStructuredError}, this lets the caller see whether the write actually
+     * succeeded instead of firing and forgetting.
+     */
+    public void writeTestEntry() throws Exception {
+        if (!isEnabled()) {
+            throw new IllegalStateException(
+                    "Structured logging is disabled (no credentials found, or DISABLE_STRUCTURED_LOGGING is set)");
+        }
+
+        StructuredLogPayload payload = new StructuredLogPayload();
+        payload.setMessage("Manual backend logging test");
+        payload.setOrigin("server");
+        payload.setSeverity("INFO");
+        payload.setContext(Map.of(
+                "service", "sk-movies-be",
+                "environment", System.getenv().getOrDefault("LOG_ENVIRONMENT", "production"),
+                "source", "test-endpoint",
+                "ts", Instant.now().toString()));
+
+        writeEntryUnsafe(payload);
+    }
+
     /** Convenience for BE code logging its own exceptions (origin=server). */
     public void logServerError(String message, Throwable error, Map<String, Object> context) {
         StructuredLogPayload payload = new StructuredLogPayload();
@@ -133,37 +158,41 @@ public class LoggingService {
 
     private void writeEntry(StructuredLogPayload payload) {
         try {
-            Severity severity = toSeverity(payload.getSeverity());
-
-            Map<String, Object> jsonPayload = new HashMap<>();
-            jsonPayload.put("message", truncate(payload.getMessage()));
-            jsonPayload.put("severity", severity.name());
-            jsonPayload.put("origin", payload.getOrigin());
-            jsonPayload.put("path", payload.getPath());
-            jsonPayload.put("url", payload.getUrl());
-            jsonPayload.put("routeId", payload.getRouteId());
-            jsonPayload.put("status", payload.getStatus());
-            jsonPayload.put("userAgent", truncate(payload.getUserAgent()));
-            jsonPayload.put("stack", truncate(payload.getStack()));
-            if (payload.getContext() != null) {
-                jsonPayload.put("context", payload.getContext());
-            }
-            jsonPayload.values().removeIf(v -> v == null);
-
-            LogEntry.Builder entryBuilder = LogEntry.newBuilder(JsonPayload.of(jsonPayload))
-                    .setSeverity(severity)
-                    .setResource(MonitoredResource.newBuilder("global").build());
-
-            if (payload.getTraceId() != null) {
-                entryBuilder.addLabel("requestTraceId", payload.getTraceId());
-            }
-            if (payload.getSessionCorrelationId() != null) {
-                entryBuilder.addLabel("sessionCorrelationId", payload.getSessionCorrelationId());
-            }
-
-            logging.write(Collections.singleton(entryBuilder.build()), Logging.WriteOption.logName(logName));
+            writeEntryUnsafe(payload);
         } catch (Exception e) {
             LOGGER.warn("Failed to write structured log entry", e);
         }
+    }
+
+    private void writeEntryUnsafe(StructuredLogPayload payload) throws Exception {
+        Severity severity = toSeverity(payload.getSeverity());
+
+        Map<String, Object> jsonPayload = new HashMap<>();
+        jsonPayload.put("message", truncate(payload.getMessage()));
+        jsonPayload.put("severity", severity.name());
+        jsonPayload.put("origin", payload.getOrigin());
+        jsonPayload.put("path", payload.getPath());
+        jsonPayload.put("url", payload.getUrl());
+        jsonPayload.put("routeId", payload.getRouteId());
+        jsonPayload.put("status", payload.getStatus());
+        jsonPayload.put("userAgent", truncate(payload.getUserAgent()));
+        jsonPayload.put("stack", truncate(payload.getStack()));
+        if (payload.getContext() != null) {
+            jsonPayload.put("context", payload.getContext());
+        }
+        jsonPayload.values().removeIf(v -> v == null);
+
+        LogEntry.Builder entryBuilder = LogEntry.newBuilder(JsonPayload.of(jsonPayload))
+                .setSeverity(severity)
+                .setResource(MonitoredResource.newBuilder("global").build());
+
+        if (payload.getTraceId() != null) {
+            entryBuilder.addLabel("requestTraceId", payload.getTraceId());
+        }
+        if (payload.getSessionCorrelationId() != null) {
+            entryBuilder.addLabel("sessionCorrelationId", payload.getSessionCorrelationId());
+        }
+
+        logging.write(Collections.singleton(entryBuilder.build()), Logging.WriteOption.logName(logName));
     }
 }
