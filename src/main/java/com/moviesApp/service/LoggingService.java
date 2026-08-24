@@ -12,9 +12,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayInputStream;
 import java.io.FileInputStream;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -32,6 +35,11 @@ import java.util.concurrent.Executors;
  * log stream, with entries tagged by an "origin" (client/server) field rather than split
  * across separate logs. Becomes a silent no-op when no Google credentials are available
  * (e.g. local dev) instead of failing app startup, same as the FE's `dev` guard.
+ * <p>
+ * Credentials are resolved in order: the raw service account key JSON pasted into the
+ * {@code GOOGLE_SERVICE_ACCOUNT_JSON} env var (how this is wired on Render, which has no
+ * clean way to place a file at a specific path), a root {@code credentials.json} file (local
+ * dev convenience), then Application Default Credentials as a last resort.
  */
 @Service
 public class LoggingService {
@@ -69,8 +77,16 @@ public class LoggingService {
     private static Logging buildClient() {
         try {
             LoggingOptions.Builder options = LoggingOptions.newBuilder();
-            // Prefer a root credentials.json when present, same convention as the FE.
-            if (Files.exists(ROOT_CREDENTIALS)) {
+
+            String inlineJson = System.getenv("GOOGLE_SERVICE_ACCOUNT_JSON");
+            if (inlineJson != null && !inlineJson.isBlank()) {
+                // Render (and most PaaS hosts) have no clean way to place a file at a specific
+                // path, so the key is pasted directly as an env var's value instead.
+                try (InputStream in = new ByteArrayInputStream(inlineJson.getBytes(StandardCharsets.UTF_8))) {
+                    options.setCredentials(GoogleCredentials.fromStream(in));
+                }
+            } else if (Files.exists(ROOT_CREDENTIALS)) {
+                // Local dev convenience — a root credentials.json, same convention as the FE.
                 try (FileInputStream in = new FileInputStream(ROOT_CREDENTIALS.toFile())) {
                     options.setCredentials(GoogleCredentials.fromStream(in));
                 }
