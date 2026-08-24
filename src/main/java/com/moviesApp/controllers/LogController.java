@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
@@ -47,6 +48,24 @@ public class LogController {
         loggingService.logStructuredError(payload);
 
         return ResponseEntity.accepted().body(Map.of("status", "accepted"));
+    }
+
+    /**
+     * Manual diagnostic — writes one entry and reports whether it actually succeeded,
+     * unlike POST /logs which is deliberately fire-and-forget.
+     */
+    @GetMapping("/test-gcp-logging")
+    public ResponseEntity<Map<String, Object>> testGcpLogging(HttpServletRequest request) {
+        if (!rateLimiter.tryAcquire(clientIp(request))) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("ok", false, "error", "rate-limited"));
+        }
+
+        try {
+            loggingService.writeTestEntry();
+            return ResponseEntity.ok(Map.of("ok", true));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body(Map.of("ok", false, "error", String.valueOf(e)));
+        }
     }
 
     private static String clientIp(HttpServletRequest request) {
