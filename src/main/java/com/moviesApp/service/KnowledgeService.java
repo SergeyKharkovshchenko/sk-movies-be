@@ -10,6 +10,7 @@ import com.moviesApp.rag.OpenAiService;
 import com.moviesApp.repositories.BikeEmbeddingRepository;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.Session;
+import org.neo4j.driver.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -765,6 +766,42 @@ public class KnowledgeService {
 
     public List<String> labels() {
         return repository.findDistinctKnowledgeLabels();
+    }
+
+    /**
+     * Full node/edge graph for one knowledge base, for FE visualization. Not cached (unlike
+     * suggestGraph/suggestSections, which cache expensive LLM calls) -- this is a cheap direct
+     * Neo4j read and should always reflect the latest state after a build/delete.
+     */
+    public Map<String, Object> graph(String label) {
+        List<Map<String, Object>> nodes = new ArrayList<>();
+        List<Map<String, Object>> edges = new ArrayList<>();
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (n:KGNode {sourceLabel: $l}) RETURN n.name AS name, labels(n) AS labels",
+                    Map.of("l", label)
+            ).forEachRemaining(record -> {
+                Map<String, Object> node = new LinkedHashMap<>();
+                node.put("id", record.get("name").asString());
+                node.put("labels", record.get("labels").asList(Value::asString).stream()
+                        .filter(l -> !l.equals("KGNode"))
+                        .toList());
+                nodes.add(node);
+            });
+
+            session.run(
+                    "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
+                            "RETURN a.name AS source, b.name AS target, type(r) AS type",
+                    Map.of("l", label)
+            ).forEachRemaining(record -> {
+                Map<String, Object> edge = new LinkedHashMap<>();
+                edge.put("source", record.get("source").asString());
+                edge.put("target", record.get("target").asString());
+                edge.put("type", record.get("type").asString());
+                edges.add(edge);
+            });
+        }
+        return Map.of("nodes", nodes, "edges", edges);
     }
 
     // ── Chunking ──────────────────────────────────────────────────────────────
