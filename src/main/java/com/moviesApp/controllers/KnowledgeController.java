@@ -198,6 +198,17 @@ public class KnowledgeController {
         }
     }
 
+    /** Full node/edge graph for one knowledge base -- { nodes: [{id, labels}], edges: [{source, target, type}] }. */
+    @GetMapping("/knowledge/graph/{label}")
+    public ResponseEntity<Map<String, Object>> graph(@PathVariable String label) {
+        try {
+            return ResponseEntity.ok(knowledgeService.graph(label));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
     /** Clear all knowledge caches (suggestGraph + suggestSections). */
     @DeleteMapping("/knowledge/cache")
     public ResponseEntity<Map<String, Object>> clearAllCaches() {
