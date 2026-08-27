@@ -2,6 +2,7 @@ package com.moviesApp.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moviesApp.entities.BikeEmbedding;
+import com.moviesApp.entities.Relation;
 import com.moviesApp.rag.EntityExtractorService;
 import com.moviesApp.rag.EntityExtractorService.ExtractionResult;
 import com.moviesApp.rag.EntityExtractorService.Triple;
@@ -229,12 +230,110 @@ public class KnowledgeService {
         return result;
     }
 
+    // ── Taxonomy (deep analysis, opt-in) ────────────────────────────────────────
+
+    private static final String TAXONOMY_PROMPT = """
+            You are a taxonomy analyst. Given a list of entity names extracted from a knowledge
+            graph, identify every PARENT-CHILD (hierarchical, taxonomic) relationship among them —
+            broader/narrower category, whole/part, type/instance, or "is a kind of" structure.
+
+            Try hard: consider every pair, not just the obviously named ones. A hierarchy can be
+            implicit — e.g. a specific named battle is a child of a broader campaign or war, a city
+            is a child of the country/region it's in, a specific model is a child of its product
+            line, an individual is a child of a group/organization they belong to, a sub-topic is a
+            child of its parent topic.
+
+            Return ONLY a valid JSON object — no markdown, no explanation:
+            {
+              "taxonomy": [
+                { "parent": "Broader Entity Name", "child": "Narrower Entity Name" }
+              ]
+            }
+
+            Rules:
+            - Both "parent" and "child" MUST be entity names taken verbatim from the provided list
+              — never invent a name that isn't in the list.
+            - Only include a pair when the hierarchical relationship is a reasonable, defensible
+              reading given the entity names and their apparent domain — do not force one that
+              isn't there.
+            - Each entity may have at most one direct parent in your output (pick the most
+              specific, immediate parent, not a distant ancestor) — do not create cycles.
+            - If no taxonomy exists among these entities at all, return {"taxonomy": []}.
+            """;
+
+    /**
+     * Opt-in extra pass: feeds every already-extracted entity name (excluding structural
+     * Section/Chunk nodes) to the LLM and asks specifically for parent-child structure, then
+     * stores each validated pair as a dedicated (parent)-[:PARENT_OF]->(child) edge — distinct
+     * from the general dynamic-predicate relationships the main extraction pass already writes.
+     * LLM output is validated against the known entity set before writing, so a hallucinated
+     * name never creates a stray node.
+     */
+    public Map<String, Object> detectAndStoreTaxonomy(String label) throws Exception {
+        List<String> entityNames;
+        try (Session session = driver.session()) { // Neo4j
+            entityNames = session.run(
+                    "MATCH (n:KGNode {sourceLabel: $l}) WHERE NOT n:Section AND NOT n:Chunk " +
+                            "RETURN n.name AS name",
+                    Map.of("l", label)
+            ).list(r -> r.get("name").asString());
+        }
+
+        if (entityNames.size() < 2) {
+            return Map.of("count", 0, "pairs", List.of());
+        }
+
+        String entityListText = entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
+        String response = openAi.chatDesign(TAXONOMY_PROMPT, entityListText, 4000).strip();
+        if (response.startsWith("```")) {
+            response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> taxonomy = (List<Map<String, String>>) parsed.getOrDefault("taxonomy", List.of());
+
+        Set<String> knownNames = new HashSet<>(entityNames);
+        List<Map<String, String>> validPairs = new ArrayList<>();
+        try (Session session = driver.session()) { // Neo4j
+            for (Map<String, String> pair : taxonomy) {
+                String parent = pair.get("parent");
+                String child  = pair.get("child");
+                if (parent == null || child == null) continue;
+                if (!knownNames.contains(parent) || !knownNames.contains(child)) continue; // drop hallucinated names
+                if (parent.equals(child)) continue;
+                session.run(
+                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                "MERGE (p)-[:PARENT_OF]->(c)",
+                        Map.of("parent", parent, "child", child, "label", label)
+                );
+                validPairs.add(Map.of("parent", parent, "child", child));
+            }
+        }
+
+        return Map.of("count", validPairs.size(), "pairs", validPairs);
+    }
+
+    /** Parent-child pairs only, for the FE's collapsible hierarchy tree view. */
+    public List<Relation> hierarchy(String label) {
+        try (Session session = driver.session()) { // Neo4j
+            return session.run(
+                    "MATCH (p:KGNode {sourceLabel: $l})-[:PARENT_OF]->(c:KGNode {sourceLabel: $l}) " +
+                            "RETURN p.name AS parent, c.name AS child",
+                    Map.of("l", label)
+            ).list(r -> new Relation(r.get("parent").asString(), r.get("child").asString()));
+        }
+    }
+
     // ── Process graph (structured) ────────────────────────────────────────────
 
     public SseEmitter processGraph(String label,
                                    List<Map<String, String>> entities,
                                    List<Map<String, String>> sections,
-                                   List<Map<String, String>> entityRelationships) {
+                                   List<Map<String, String>> entityRelationships,
+                                   boolean deepAnalysis) {
         SseEmitter emitter = new SseEmitter(300_000L);
         executor.submit(() -> {
             try {
@@ -422,6 +521,19 @@ public class KnowledgeService {
                     }
                     repository.saveAll(embedEntities); // PostgreSQL
                     send(emitter, "entities_embedded", Map.of("count", entityNames.size()));
+                }
+
+                // 5. Optional deep analysis: detect and store parent-child taxonomy
+                if (deepAnalysis) {
+                    send(emitter, "taxonomy_start", Map.of());
+                    try {
+                        Map<String, Object> taxonomyResult = detectAndStoreTaxonomy(label);
+                        send(emitter, "taxonomy_stored", taxonomyResult);
+                    } catch (Exception e) {
+                        // Non-fatal -- the main graph is already built; taxonomy is a bonus step.
+                        send(emitter, "taxonomy_error", Map.of(
+                                "message", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                    }
                 }
 
                 long nodeCount = countNodes(label);

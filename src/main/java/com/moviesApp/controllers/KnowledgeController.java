@@ -1,5 +1,6 @@
 package com.moviesApp.controllers;
 
+import com.moviesApp.entities.Relation;
 import com.moviesApp.service.KnowledgeService;
 import org.springframework.cache.CacheManager;
 import org.springframework.http.MediaType;
@@ -60,6 +61,7 @@ public class KnowledgeController {
     @PostMapping(value = "/knowledge/process-graph", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter processGraph(@RequestBody Map<String, Object> body) {
         String label = String.valueOf(body.getOrDefault("label", "default")).trim();
+        boolean deepAnalysis = Boolean.TRUE.equals(body.get("deepAnalysis"));
 
         @SuppressWarnings("unchecked")
         List<Map<String, String>> entities = body.containsKey("entities")
@@ -71,7 +73,7 @@ public class KnowledgeController {
         List<Map<String, String>> entityRelationships = body.containsKey("entityRelationships")
                 ? (List<Map<String, String>>) body.get("entityRelationships") : List.of();
 
-        return knowledgeService.processGraph(label, entities, sections, entityRelationships);
+        return knowledgeService.processGraph(label, entities, sections, entityRelationships, deepAnalysis);
     }
 
     /**
@@ -206,6 +208,19 @@ public class KnowledgeController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * Parent-child pairs only (from the opt-in "deep analysis" taxonomy step at process time),
+     * for the FE's collapsible hierarchy tree -- same { parent, child } shape as /relations.
+     */
+    @GetMapping("/knowledge/graph/{label}/hierarchy")
+    public ResponseEntity<List<Relation>> hierarchy(@PathVariable String label) {
+        try {
+            return ResponseEntity.ok(knowledgeService.hierarchy(label));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().build();
         }
     }
 
