@@ -171,6 +171,29 @@ public class KnowledgeController {
         }
     }
 
+    /**
+     * LLM-as-judge for the FE's "compare" rag mode -- judges two already-generated answers to
+     * the same question. Body: { question, answerA, labelA, answerB, labelB }.
+     */
+    @PostMapping("/knowledge/compare-analyze")
+    public ResponseEntity<Map<String, Object>> compareAnalyze(@RequestBody Map<String, String> body) {
+        try {
+            String question = body.get("question");
+            String answerA  = body.get("answerA");
+            String answerB  = body.get("answerB");
+            if (question == null || question.isBlank() || answerA == null || answerB == null) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("error", "question, answerA, and answerB are required"));
+            }
+            String labelA = body.getOrDefault("labelA", "A");
+            String labelB = body.getOrDefault("labelB", "B");
+            return ResponseEntity.ok(knowledgeService.compareAnalyze(question, answerA, labelA, answerB, labelB));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
     @DeleteMapping("/knowledge/{label}")
     public ResponseEntity<Map<String, Object>> delete(@PathVariable String label) {
         try {

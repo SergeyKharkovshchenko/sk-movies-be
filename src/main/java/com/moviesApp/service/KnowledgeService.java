@@ -836,6 +836,69 @@ public class KnowledgeService {
         return result;
     }
 
+    // ── Compare mode: judge two answers ─────────────────────────────────────────
+
+    private static final String COMPARE_PROMPT = """
+            You are an impartial judge comparing two candidate answers to the same question,
+            produced by two different retrieval strategies over the same knowledge base. Decide
+            which answer is better supported, more accurate, and more directly responsive to the
+            question -- or whether they're genuinely equivalent.
+
+            Return ONLY a valid JSON object -- no markdown, no explanation outside the JSON:
+            {
+              "verdict": "A" | "B" | "tie",
+              "explanation": "..."
+            }
+
+            Judge on:
+            - Faithfulness: does the answer avoid claims unsupported by its own retrieved context?
+            - Completeness: does it actually address every part of the question?
+            - Specificity: does it name concrete entities/relationships rather than vague
+              generalities?
+            - Directness: does it answer the question asked, not a nearby one?
+
+            "explanation" must be 2-4 sentences, specific about WHY one answer wins (or why they
+            tie) -- not a generic restatement of the judging criteria.
+            """;
+
+    /**
+     * LLM-as-judge for the FE's "compare" rag mode, which sends the same question through two
+     * retrieval strategies and gets back two separate answers. modeA/modeB are the caller's own
+     * labels for each side (e.g. "vector"/"combined") -- the returned verdict is normalized back
+     * to one of those two labels (or "tie") rather than the generic "A"/"B" the LLM reasons in,
+     * so the FE can compare it directly against the ragMode already on each message.
+     */
+    public Map<String, Object> compareAnalyze(String question, String answerA, String modeA,
+                                               String answerB, String modeB) throws Exception {
+        String input = String.format("""
+                QUESTION:
+                %s
+
+                ANSWER A (%s):
+                %s
+
+                ANSWER B (%s):
+                %s
+                """, question, modeA, answerA, modeB, answerB);
+
+        String response = openAi.chatDesign(COMPARE_PROMPT, input, 2000).strip();
+        if (response.startsWith("```")) {
+            response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> parsed = new LinkedHashMap<>(objectMapper.readValue(response, Map.class));
+        Object verdict = parsed.get("verdict");
+        if ("A".equals(verdict)) {
+            parsed.put("verdict", modeA);
+        } else if ("B".equals(verdict)) {
+            parsed.put("verdict", modeB);
+        } else {
+            parsed.put("verdict", "tie");
+        }
+        return parsed;
+    }
+
     // ── Management ───────────────────────────────────────────────────────────
 
     public Map<String, Object> delete(String label) {
