@@ -334,7 +334,11 @@ public class KnowledgeService {
                                    List<Map<String, String>> sections,
                                    List<Map<String, String>> entityRelationships,
                                    boolean deepAnalysis) {
-        SseEmitter emitter = new SseEmitter(300_000L);
+        // 5 minutes wasn't enough for a knowledge base with 25+ sections -- each section does an
+        // LLM extraction call plus embedding calls, so a large paste can legitimately run past
+        // 300s and get cut off right before reaching the (sequentially last) taxonomy step below,
+        // leaving a partially-processed graph with no parent-child data despite deepAnalysis=true.
+        SseEmitter emitter = new SseEmitter(900_000L);
         executor.submit(() -> {
             try {
                 long existing = countNodes(label);
@@ -560,7 +564,7 @@ public class KnowledgeService {
     // ── Process ──────────────────────────────────────────────────────────────
 
     public SseEmitter process(List<Map<String, String>> sections, String label) {
-        SseEmitter emitter = new SseEmitter(300_000L);
+        SseEmitter emitter = new SseEmitter(900_000L);
         executor.submit(() -> {
             try {
                 int totalSections = sections.size();
