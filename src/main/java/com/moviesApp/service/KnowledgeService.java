@@ -243,22 +243,25 @@ public class KnowledgeService {
             line, an individual is a child of a group/organization they belong to, a sub-topic is a
             child of its parent topic.
 
-            Return ONLY a valid JSON object — no markdown, no explanation:
+            Return ONLY a valid JSON object — no markdown, no explanation. Group by parent so each
+            parent name is written once, not once per child -- this keeps the response compact when
+            a parent has many children (e.g. a product line with a dozen models):
             {
-              "taxonomy": [
-                { "parent": "Broader Entity Name", "child": "Narrower Entity Name" }
-              ]
+              "taxonomy": {
+                "Broader Entity Name": ["Narrower Entity Name", "Another Narrower Entity Name"],
+                "Another Broader Entity Name": ["..."]
+              }
             }
 
             Rules:
-            - Both "parent" and "child" MUST be entity names taken verbatim from the provided list
-              — never invent a name that isn't in the list.
+            - Every key and every array entry MUST be an entity name taken verbatim from the
+              provided list — never invent a name that isn't in the list.
             - Only include a pair when the hierarchical relationship is a reasonable, defensible
               reading given the entity names and their apparent domain — do not force one that
               isn't there.
-            - Each entity may have at most one direct parent in your output (pick the most
-              specific, immediate parent, not a distant ancestor) — do not create cycles.
-            - If no taxonomy exists among these entities at all, return {"taxonomy": []}.
+            - Each entity may appear as a child at most once across the whole object (pick the
+              most specific, immediate parent, not a distant ancestor) — do not create cycles.
+            - If no taxonomy exists among these entities at all, return {"taxonomy": {}}.
             """;
 
     /**
@@ -283,8 +286,15 @@ public class KnowledgeService {
             return Map.of("count", 0, "pairs", List.of());
         }
 
+        // At 4000 tokens the taxonomy JSON legitimately ran past the budget and got cut off
+        // mid-string on a 50+ entity graph, failing to parse entirely rather than gracefully
+        // returning a partial result. Raising the budget alone doesn't fully fix it either --
+        // gpt-4o-mini's own output ceiling is ~16384 tokens, so a flat list of {parent, child}
+        // pairs (repeating the parent name once per child) can still overflow it on a
+        // one-parent-many-children hierarchy. Grouping children under one parent-name-per-key
+        // (see TAXONOMY_PROMPT) cuts that repetition instead of just asking for more room.
         String entityListText = entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
-        String response = openAi.chatDesign(TAXONOMY_PROMPT, entityListText, 4000).strip();
+        String response = openAi.chatDesign(TAXONOMY_PROMPT, entityListText, 16000).strip();
         if (response.startsWith("```")) {
             response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
@@ -292,24 +302,27 @@ public class KnowledgeService {
         @SuppressWarnings("unchecked")
         Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
         @SuppressWarnings("unchecked")
-        List<Map<String, String>> taxonomy = (List<Map<String, String>>) parsed.getOrDefault("taxonomy", List.of());
+        Map<String, List<String>> taxonomy = (Map<String, List<String>>) parsed.getOrDefault("taxonomy", Map.of());
 
         Set<String> knownNames = new HashSet<>(entityNames);
         List<Map<String, String>> validPairs = new ArrayList<>();
         try (Session session = driver.session()) { // Neo4j
-            for (Map<String, String> pair : taxonomy) {
-                String parent = pair.get("parent");
-                String child  = pair.get("child");
-                if (parent == null || child == null) continue;
-                if (!knownNames.contains(parent) || !knownNames.contains(child)) continue; // drop hallucinated names
-                if (parent.equals(child)) continue;
-                session.run(
-                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                                "MERGE (p)-[:PARENT_OF]->(c)",
-                        Map.of("parent", parent, "child", child, "label", label)
-                );
-                validPairs.add(Map.of("parent", parent, "child", child));
+            for (Map.Entry<String, List<String>> entry : taxonomy.entrySet()) {
+                String parent = entry.getKey();
+                if (parent == null || !knownNames.contains(parent)) continue; // drop hallucinated names
+                List<String> children = entry.getValue();
+                if (children == null) continue;
+                for (String child : children) {
+                    if (child == null || !knownNames.contains(child)) continue;
+                    if (parent.equals(child)) continue;
+                    session.run(
+                            "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                    "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                    "MERGE (p)-[:PARENT_OF]->(c)",
+                            Map.of("parent", parent, "child", child, "label", label)
+                    );
+                    validPairs.add(Map.of("parent", parent, "child", child));
+                }
             }
         }
 
