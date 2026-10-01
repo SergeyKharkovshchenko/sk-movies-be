@@ -848,10 +848,15 @@ public class KnowledgeService {
             which answer is better supported, more accurate, and more directly responsive to the
             question -- or whether they're genuinely equivalent.
 
-            Return ONLY a valid JSON object -- no markdown, no explanation outside the JSON:
+            Return ONLY a valid JSON object -- no markdown, no explanation outside the JSON. All
+            four keys are REQUIRED in every response, including failureModeA/failureModeB: when a
+            pattern doesn't apply, write the literal JSON value null for that key -- never omit the
+            key itself.
             {
               "verdict": "A" | "B" | "tie",
-              "explanation": "..."
+              "explanation": "...",
+              "failureModeA": "hallucination" | "false_completeness" | null,
+              "failureModeB": "hallucination" | "false_completeness" | null
             }
 
             Judge on:
@@ -861,16 +866,38 @@ public class KnowledgeService {
               generalities?
             - Directness: does it answer the question asked, not a nearby one?
 
+            Additionally, check each answer for these two specific, common failure patterns and set
+            failureModeA/failureModeB accordingly (independently -- either, both, or neither answer
+            can show one):
+            - "hallucination": the answer states something with unwarranted confidence that isn't
+              actually grounded in its own context -- a plausible-sounding claim that doesn't follow
+              from what was retrieved (e.g. inferring compatibility/equivalence from surface
+              similarity rather than an actual stated fact). A hedge like "I cannot confirm this
+              from the given context" is NOT a hallucination -- it's an honest non-answer; only flag
+              genuine confident-but-unsupported assertions.
+            - "false_completeness": the answer presents a count or list as if exhaustive (a
+              definite "there are N" or "these are all of them") when it's actually a partial
+              subset -- confidently wrong about completeness, not just imprecise.
+            An answer can have both, one, or neither. Most answers will have neither -- null is the
+            common case, don't force a diagnosis onto an answer that's simply correct or simply
+            incomplete-but-appropriately-hedged.
+
             "explanation" must be 2-4 sentences, specific about WHY one answer wins (or why they
-            tie) -- not a generic restatement of the judging criteria.
+            tie) -- not a generic restatement of the judging criteria. If you set a failureMode on
+            either side, name it explicitly in the explanation with the specific unsupported claim
+            or the specific missing items, not just the label.
             """;
 
     /**
      * LLM-as-judge for the FE's "compare" rag mode, which sends the same question through two
      * retrieval strategies and gets back two separate answers. modeA/modeB are the caller's own
-     * labels for each side (e.g. "vector"/"combined") -- the returned verdict is normalized back
+     * labels for each side (e.g. "vector"/"graph") -- the returned verdict is normalized back
      * to one of those two labels (or "tie") rather than the generic "A"/"B" the LLM reasons in,
      * so the FE can compare it directly against the ragMode already on each message.
+     *
+     * Also returns failureModeA/failureModeB (each "hallucination" | "false_completeness" | null),
+     * a fixed-position pair -- A always describes answerA's failure mode, B always answerB's, no
+     * remapping needed since (unlike verdict) the LLM isn't choosing which side to describe.
      */
     public Map<String, Object> compareAnalyze(String question, String answerA, String modeA,
                                                String answerB, String modeB) throws Exception {
