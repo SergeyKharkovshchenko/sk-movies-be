@@ -9,6 +9,5 @@ import org.springframework.context.annotation.ComponentScan;
 public class skMoviesApp {
     public static void main(String[] args) {
         SpringApplication.run(skMoviesApp.class, args);
-
     }
 }
