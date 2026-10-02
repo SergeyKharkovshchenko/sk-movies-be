@@ -856,6 +856,17 @@ public class KnowledgeService {
         result.put("graphContext", graphContext);
         result.put("cypherTrace",  cypherTrace);
         result.put("vectorChunks", vectorChunks);
+        // Strict mode's entire contract is "don't say anything the context doesn't support" --
+        // the prompt instructs that, but a prompt is a strong steering signal, not a technical
+        // guarantee (observed directly: a model can still state a real-world fact about a
+        // recognized entity that was never in the context at all). A second, independent LLM
+        // call that only sees the context and the finished answer -- never asked to produce an
+        // answer itself -- checks whether every claim is actually supported. Only run under
+        // strict, since non-strict mode explicitly permits labeled inference beyond the context,
+        // which this check would otherwise flag as a false positive on every answer.
+        if (strict) {
+            result.put("groundingCheck", checkGrounding(answer, contextText));
+        }
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
                 "seedPriority",    seedPriority,
@@ -867,6 +878,72 @@ public class KnowledgeService {
                 "neighborLimit",   effectiveNeighborLimit
         ));
         return result;
+    }
+
+    private static final String GROUNDING_CHECK_PROMPT = """
+            You are a fact-checker. You will be given a CONTEXT and an ANSWER that was supposed to
+            be derived only from that context. Identify any factual claim in the ANSWER that is
+            NOT actually supported by the CONTEXT -- including a claim that happens to be true in
+            the real world but isn't stated or implied by this specific context. The context
+            defines a closed, self-contained world; anything the answer adds from outside it,
+            even about an entity you recognize, counts as unsupported.
+
+            Return ONLY a valid JSON object -- no markdown, no explanation:
+            {
+              "grounded": true | false,
+              "unsupportedClaims": ["claim 1", "claim 2"]
+            }
+
+            Rules:
+            - "grounded" is false whenever unsupportedClaims is non-empty, true otherwise.
+            - Only flag factual claims (who did what, a relationship, a number, a date) -- never
+              flag the answer's own phrasing, formatting, or a reasonable paraphrase of a fact the
+              context does state.
+            - A claim explicitly labeled by the answer as inferred/possible (e.g. "Possible reason
+              (inferred, not explicitly stated): ...") is not itself a violation -- only flag it if
+              even the underlying fact it reasons from isn't in the context.
+            - A uniqueness, completeness, or count claim ("X is the only one with property Y",
+              "there are exactly N") IS grounded as long as every entity the context mentions with
+              that property is accounted for in the claim -- i.e. it correctly follows from
+              everything the context states, even though no single sentence spells out the word
+              "only" or the number. Do not flag correct reasoning over the full context as
+              unsupported just because the conclusion itself isn't stated verbatim somewhere.
+            - If the answer correctly declines to answer (e.g. "Not in knowledge base."), grounded
+              is true and unsupportedClaims is empty.
+            - Quote each unsupported claim close to how the answer phrased it, so it's clear which
+              part of the answer is the problem.
+            """;
+
+    /**
+     * Post-hoc faithfulness check for a strict-mode answer: a second LLM call that only sees the
+     * context and the already-generated answer (never asked to produce an answer of its own), and
+     * reports any claim not actually supported by that context. Failing open on error -- a check
+     * that couldn't run reports "unknown" (grounded: null) rather than a false "clean" or a false
+     * alarm, since the main answer is already generated either way.
+     */
+    private Map<String, Object> checkGrounding(String answer, String contextText) {
+        try {
+            String input = String.format("""
+                    CONTEXT:
+                    %s
+
+                    ANSWER:
+                    %s
+                    """, contextText, answer);
+            String response = openAi.chatDesign(GROUNDING_CHECK_PROMPT, input, 1000).strip();
+            if (response.startsWith("```")) {
+                response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
+            return parsed;
+        } catch (Exception e) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("grounded", null);
+            result.put("unsupportedClaims", List.of());
+            result.put("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            return result;
+        }
     }
 
     // ── Compare mode: judge two answers ─────────────────────────────────────────
