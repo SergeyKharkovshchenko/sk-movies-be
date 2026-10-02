@@ -10,6 +10,7 @@ import com.moviesApp.rag.JinaEmbeddingProvider;
 import com.moviesApp.rag.OpenAiService;
 import com.moviesApp.repositories.BikeEmbeddingRepository;
 import org.neo4j.driver.Driver;
+import org.neo4j.driver.Record;
 import org.neo4j.driver.Session;
 import org.neo4j.driver.Value;
 import org.slf4j.Logger;
@@ -741,6 +742,13 @@ public class KnowledgeService {
         List<String>              seedNodes;
         String                    contextText;
 
+        // Diagnostic collectors, surfaced to the FE alongside the answer so a response can show
+        // exactly what was asked of each store -- every Cypher query actually run against Neo4j
+        // (graph/combined modes), and every chunk/entity-name text actually returned by the
+        // pgvector similarity search (vector/combined modes). Neither affects retrieval itself.
+        List<Map<String, Object>> cypherTrace  = new ArrayList<>();
+        List<Map<String, Object>> vectorChunks = new ArrayList<>();
+
         if ("vector".equals(ragMode)) {
             // PostgreSQL only — embed question, search both entity names and chunk text
             float[] vec = jina.embed(List.of(question)).get(0);
@@ -749,10 +757,11 @@ public class KnowledgeService {
             seedNodes    = matches.stream().map(BikeEmbedding::getName).collect(Collectors.toList());
             graphContext = List.of();
             contextText  = buildVectorContextFromMatches(matches, label);
+            vectorChunks.addAll(toVectorChunkEntries(matches));
 
         } else if ("graph".equals(ragMode)) {
             // Neo4j only — keyword-match node names, expand relationships, skip PostgreSQL
-            graphContext = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit);
+            graphContext = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, cypherTrace);
             seedNodes    = graphContext.stream()
                     .map(e -> (String) e.getOrDefault("node", ""))
                     .distinct().filter(s -> !s.isEmpty()).collect(Collectors.toList());
@@ -764,8 +773,9 @@ public class KnowledgeService {
             float[] vec = jina.embed(List.of(question)).get(0);
             List<BikeEmbedding> matches = repository.findSimilarAllTypesByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
-            List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit);
-            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit);
+            vectorChunks.addAll(toVectorChunkEntries(matches));
+            List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit, cypherTrace);
+            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, cypherTrace);
 
             boolean graphFirst = !"vector".equals(seedPriority);
             Stream<Map<String, Object>> first  = graphFirst ? keywordCtx.stream() : vectorCtx.stream();
@@ -840,6 +850,8 @@ public class KnowledgeService {
         result.put("label",        label);
         result.put("question",     question);
         result.put("graphContext", graphContext);
+        result.put("cypherTrace",  cypherTrace);
+        result.put("vectorChunks", vectorChunks);
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
                 "seedPriority",    seedPriority,
@@ -1190,9 +1202,43 @@ public class KnowledgeService {
         return sb.toString();
     }
 
+    // Flattens pgvector matches into plain text entries for the FE -- textContent is the real
+    // passage for a chunk-type match, or just a repeat of the entity name for a name-type match
+    // (see how BikeEmbedding rows get built in processGraph), so this is always human-readable,
+    // never the embedding vector itself.
+    private List<Map<String, Object>> toVectorChunkEntries(List<BikeEmbedding> matches) {
+        return matches.stream()
+                .map(m -> {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("sourceType", Objects.toString(m.getSourceType(), ""));
+                    entry.put("name",       Objects.toString(m.getName(), ""));
+                    entry.put("text",       Objects.toString(m.getTextContent(), ""));
+                    return entry;
+                })
+                .collect(Collectors.toList());
+    }
+
+    // Runs a Cypher query and, when a trace collector is supplied, records the query text, its
+    // parameters, and how many rows came back -- purely diagnostic (surfaced to the FE so a chat
+    // answer can show exactly what was asked of the database), never affects retrieval itself.
+    private List<Record> runTraced(Session session, String stage, String cypher,
+                                    Map<String, Object> params, List<Map<String, Object>> cypherTrace) {
+        List<Record> rows = session.run(cypher, params).list();
+        if (cypherTrace != null) {
+            cypherTrace.add(Map.of(
+                    "stage",       stage,
+                    "query",       cypher,
+                    "params",      params,
+                    "resultCount", rows.size()
+            ));
+        }
+        return rows;
+    }
+
     // graph mode: keyword-match node names in Neo4j, expand 1-hop + 2-hop — no PostgreSQL
     private List<Map<String, Object>> buildKeywordGraphContext(String question, String label,
-                                                               int topK, int neighborLimit) {
+                                                               int topK, int neighborLimit,
+                                                               List<Map<String, Object>> cypherTrace) {
         List<String> keywords = Arrays.stream(question.toLowerCase().split("\\W+"))
                 .filter(w -> w.length() > 3)
                 .distinct()
@@ -1205,15 +1251,16 @@ public class KnowledgeService {
 
         try (Session session = driver.session()) { // Neo4j
             // 1-hop from keyword-matched nodes
-            session.run(
+            runTraced(session, "keyword match + 1-hop expansion",
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                     "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                     "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                     "LIMIT $limit",
-                    Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit)
-            ).list().forEach(r -> {
+                    Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit),
+                    cypherTrace
+            ).forEach(r -> {
                 String relType      = r.get("relType").asString("");
                 String nodeName     = r.get("node").asString("");
                 String neighborName = r.get("neighborName").asString("");
@@ -1233,14 +1280,15 @@ public class KnowledgeService {
             int twoHopLimit = Math.max(3, neighborLimit / 4);
             for (String name : twoHopSeeds) {
                 if (!expanded.add(name)) continue;
-                session.run(
+                runTraced(session, "2-hop expansion from \"" + name + "\"",
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                         "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                         "LIMIT $limit",
-                        Map.of("name", name, "label", label, "limit", twoHopLimit)
-                ).list().forEach(r -> context.add(Map.of(
+                        Map.of("name", name, "label", label, "limit", twoHopLimit),
+                        cypherTrace
+                ).forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
                         "relationship", r.get("relType").asString(""),
                         "neighbor",     r.get("neighborName").asString(""),
@@ -1261,7 +1309,8 @@ public class KnowledgeService {
                 .collect(Collectors.toList());
     }
 
-    private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit) {
+    private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit,
+                                                         List<Map<String, Object>> cypherTrace) {
         List<Map<String, Object>> context = new ArrayList<>();
         Set<String> seedEntityNames = new LinkedHashSet<>();
 
@@ -1273,13 +1322,14 @@ public class KnowledgeService {
                     if (text != null && !text.isEmpty())
                         context.add(Map.of("passage", text, "source", match.getName()));
                     // Traverse chunk → section → entity to get a graph expansion seed
-                    session.run(
+                    runTraced(session, "resolve parent entity for chunk \"" + match.getName() + "\"",
                             "MATCH (c:KGNode {name: $name, sourceLabel: $label})" +
                             "<-[:HAS_CHUNK]-(s:KGNode)<-[r]-(e:KGNode {sourceLabel: $label}) " +
                             "WHERE NOT e.nodeType IN ['section','chunk'] " +
                             "RETURN e.name AS entityName LIMIT 1",
-                            Map.of("name", match.getName(), "label", label)
-                    ).list().forEach(r -> {
+                            Map.of("name", match.getName(), "label", label),
+                            cypherTrace
+                    ).forEach(r -> {
                         String en = r.get("entityName").asString("");
                         if (!en.isEmpty()) seedEntityNames.add(en);
                     });
@@ -1296,14 +1346,15 @@ public class KnowledgeService {
         Set<String> twoHopSeeds = new LinkedHashSet<>();
         try (Session session = driver.session()) { // Neo4j
             for (String name : seedEntityNames) {
-                session.run(
+                runTraced(session, "1-hop expansion from \"" + name + "\"",
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                         "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
                         "LIMIT $limit",
-                        Map.of("name", name, "label", label, "limit", neighborLimit)
-                ).list().forEach(r -> {
+                        Map.of("name", name, "label", label, "limit", neighborLimit),
+                        cypherTrace
+                ).forEach(r -> {
                     String relType      = r.get("relType").asString("");
                     String neighborName = r.get("neighborName").asString("");
                     context.add(Map.of(
@@ -1326,14 +1377,15 @@ public class KnowledgeService {
         try (Session session = driver.session()) { // Neo4j
             for (String name : twoHopSeeds) {
                 if (!expanded.add(name)) continue;
-                session.run(
+                runTraced(session, "2-hop expansion from \"" + name + "\"",
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                         "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
                         "LIMIT $limit",
-                        Map.of("name", name, "label", label, "limit", twoHopLimit)
-                ).list().forEach(r -> context.add(Map.of(
+                        Map.of("name", name, "label", label, "limit", twoHopLimit),
+                        cypherTrace
+                ).forEach(r -> context.add(Map.of(
                         "node",         r.get("node").asString(""),
                         "relationship", r.get("relType").asString(""),
                         "neighbor",     r.get("neighborName").asString(""),
