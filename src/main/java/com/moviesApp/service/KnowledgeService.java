@@ -834,7 +834,11 @@ public class KnowledgeService {
                   "the same way you would label a POSSIBLE_ relationship. " + possibleRelHandling +
                   "\n\nContext:\n" + contextText;
 
-        double effectiveTemperature = temperature > 0 ? temperature : 0.7;
+        // strict mode's whole point is deterministic, context-only output -- a non-zero
+        // temperature works against that (sampling randomness can still vary phrasing, or in
+        // edge cases how faithfully the model follows the "answer only from context" instruction),
+        // so strict always forces greedy decoding regardless of whatever temperature was requested.
+        double effectiveTemperature = strict ? 0.0 : (temperature > 0 ? temperature : 0.7);
 
         List<Map<String, String>> messages = new ArrayList<>(history);
         messages.add(0, Map.of("role", "system", "content", systemPrompt));
