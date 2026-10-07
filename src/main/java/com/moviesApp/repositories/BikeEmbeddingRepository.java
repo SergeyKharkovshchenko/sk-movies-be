@@ -82,7 +82,13 @@ public interface BikeEmbeddingRepository extends JpaRepository<BikeEmbedding, Lo
 
     long countBySourceTypeAndLabels(String sourceType, String labels);
 
-    @Query(value = "SELECT DISTINCT labels FROM bike_embeddings WHERE source_type = 'knowledge_node'",
-           nativeQuery = true)
+    // Unfiltered by source_type -- a label created purely via CSV import (knowledge_node-free,
+    // only chunk_text rows) must still be countable/discoverable here.
+    long countByLabels(String labels);
+
+    // Unfiltered by source_type for the same reason: a label with only chunk_text rows (e.g.
+    // CSV-only import, no suggest-graph/process-graph run) is still a real, chat-able knowledge
+    // base and must show up in /knowledge/labels and /knowledge/status.
+    @Query(value = "SELECT DISTINCT labels FROM bike_embeddings", nativeQuery = true)
     List<String> findDistinctKnowledgeLabels();
 }

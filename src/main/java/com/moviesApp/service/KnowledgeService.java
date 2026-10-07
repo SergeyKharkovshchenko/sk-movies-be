@@ -1332,7 +1332,7 @@ public class KnowledgeService {
         List<String> knownLabels = repository.findDistinctKnowledgeLabels(); // PostgreSQL
         List<Map<String, Object>> perLabel = new ArrayList<>();
         for (String label : knownLabels) {
-            long embeddings = repository.countBySourceTypeAndLabels(SOURCE_TYPE, label); // PostgreSQL
+            long embeddings = repository.countByLabels(label); // PostgreSQL -- all source types
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("label", label);
             entry.put("embeddings", embeddings);
