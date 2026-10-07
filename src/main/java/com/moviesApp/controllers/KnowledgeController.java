@@ -138,6 +138,30 @@ public class KnowledgeController {
         return knowledgeService.process(sections, label);
     }
 
+    /**
+     * Deterministic CSV import: no LLM step. Each file's rows become graph nodes/relationships
+     * by column-naming convention (see KnowledgeService#importCsv), plus a flattened-sentence
+     * embedding per entity row. Idempotent (MERGE-based) -- can be re-run or combined with a
+     * text-derived KB under the same label.
+     * Body: { "label": "insurance-claims", "files": [{ "name": "Claim.csv", "content": "..." }] }
+     */
+    @PostMapping("/knowledge/import-csv")
+    public ResponseEntity<Map<String, Object>> importCsv(@RequestBody Map<String, Object> body) {
+        String label = String.valueOf(body.getOrDefault("label", "default")).trim();
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> files = body.containsKey("files")
+                ? (List<Map<String, String>>) body.get("files") : List.of();
+        if (files.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "files is required"));
+        }
+        try {
+            return ResponseEntity.ok(knowledgeService.importCsv(label, files));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
     @PostMapping("/napoleon-chat")
     public ResponseEntity<Map<String, Object>> napoleonChat(@RequestBody Map<String, Object> body) {
         try {
