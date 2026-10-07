@@ -575,6 +575,284 @@ public class KnowledgeService {
         return emitter;
     }
 
+    // ── Import CSV (deterministic, non-LLM) ─────────────────────────────────────
+    //
+    // Neo4j's own LOAD CSV reads from the server's local import directory or a URL, neither of
+    // which fits a browser drag-and-drop upload through this API -- so instead we parse the CSV
+    // in-process and drive the same Bolt session the rest of this service already uses, via
+    // UNWIND-free per-row MERGE calls (small row counts here, so per-row calls stay simple and
+    // readable rather than building dynamic batched Cypher).
+    //
+    // Classification is by column-naming convention alone (OMG/Spider-style "<Table>_Identifier"
+    // foreign keys), not a fixed schema, so it generalizes to any CSV set that follows the same
+    // convention:
+    //   - ENTITY: a column exactly named "<table>_Identifier" exists -> that's the node's key;
+    //             every other "*_Identifier" column becomes an outgoing relationship.
+    //   - JOIN:   no own-PK column, but 2+ "*_Identifier" columns -> a relationship between the
+    //             first two, with remaining columns as relationship properties.
+    //   - TAG:    no own-PK column, exactly 1 "*_Identifier" column -> adds this table's name as
+    //             an extra label (plus any extra columns as properties) onto the node that column
+    //             points at, e.g. Loss_Payment.csv marking a Claim_Amount row as a loss payment.
+    //   - LOOKUP: no "*_Identifier" column at all -> falls back to the first column as the key
+    //             (handles small reference tables like Party_Role.csv keyed by a code).
+    // Relationship/node identity is the same `name` + `sourceLabel` convention used everywhere
+    // else in this file, so CSV-derived nodes show up in /knowledge/graph, /status, and delete
+    // exactly like LLM-derived ones. Unlike processGraph, this is plain idempotent MERGE, so it
+    // has no "already processed" guard and can be re-run or combined with a text-derived KB under
+    // the same label. Row embeddings reuse CHUNK_SOURCE_TYPE (not a separate "csv_row" type):
+    // they're full-sentence passages just like text chunks, and both findSimilarAllTypesByLabel's
+    // native query and buildVectorContextFromMatches's chunk/entity split only treat
+    // CHUNK_SOURCE_TYPE rows as retrievable passage text -- a third source type would be silently
+    // invisible to vector search and, if the repository query were also widened, would still only
+    // render as a bare name rather than the full row sentence.
+
+    public Map<String, Object> importCsv(String label, List<Map<String, String>> files) throws Exception {
+        List<String> warnings = new ArrayList<>();
+        List<CsvTable> tables = new ArrayList<>();
+        for (Map<String, String> file : files) {
+            String fileName = file.get("name");
+            String content  = file.get("content");
+            if (fileName == null || content == null || content.isBlank()) {
+                warnings.add("Skipped empty file: " + fileName);
+                continue;
+            }
+            String tableName = fileName.replaceAll("(?i)\\.csv$", "");
+            List<Map<String, String>> rows = parseCsv(content);
+            if (rows.isEmpty()) {
+                warnings.add("No data rows in: " + fileName);
+                continue;
+            }
+            tables.add(new CsvTable(tableName, new ArrayList<>(rows.get(0).keySet()), rows));
+        }
+
+        int entityRows = 0, joinRows = 0, tagRows = 0, lookupRows = 0, relationshipsCreated = 0;
+        List<String> embedNames = new ArrayList<>();
+        List<String> embedTexts = new ArrayList<>();
+
+        try (Session session = driver.session()) { // Neo4j
+            for (CsvTable table : tables) {
+                String tableLabel = sanitizeNeo4jName(table.name());
+                List<String> idCols = table.headers().stream()
+                        .filter(h -> h.endsWith("_Identifier")).toList();
+                String ownPk = idCols.stream()
+                        .filter(h -> h.equalsIgnoreCase(table.name() + "_Identifier"))
+                        .findFirst().orElse(null);
+
+                if (ownPk != null) {
+                    List<String> fkCols = idCols.stream().filter(c -> !c.equals(ownPk)).toList();
+                    for (Map<String, String> row : table.rows()) {
+                        String idValue = row.get(ownPk);
+                        if (idValue == null || idValue.isBlank()) continue;
+                        String nodeName = tableLabel + "-" + idValue;
+                        mergeCsvNode(session, label, tableLabel, nodeName, rowProperties(row, table.headers(), idCols));
+                        for (String fk : fkCols) {
+                            String fkValue = row.get(fk);
+                            if (fkValue == null || fkValue.isBlank()) continue;
+                            String targetLabel = sanitizeNeo4jName(stripIdentifierSuffix(fk));
+                            String targetName  = targetLabel + "-" + fkValue;
+                            mergeCsvNode(session, label, targetLabel, targetName, null);
+                            mergeCsvRelationship(session, label, nodeName, targetName,
+                                    "HAS_" + targetLabel.toUpperCase(), null);
+                            relationshipsCreated++;
+                        }
+                        embedNames.add(nodeName);
+                        // Only the row's own PK is excluded here (unlike the node's `props`, which
+                        // drops all *_Identifier columns since those become graph edges instead) --
+                        // vector search has no access to those edges, so FK values must stay in the
+                        // embedded sentence as plain text or the row becomes unlinkable by meaning
+                        // alone, e.g. a Claim_Amount row would never mention which Claim it belongs to.
+                        embedTexts.add(csvRowSentence(tableLabel, idValue, row, table.headers(), List.of(ownPk)));
+                        entityRows++;
+                    }
+                } else if (idCols.size() >= 2) {
+                    String fromCol = idCols.get(0), toCol = idCols.get(1);
+                    String fromLabel = sanitizeNeo4jName(stripIdentifierSuffix(fromCol));
+                    String toLabel    = sanitizeNeo4jName(stripIdentifierSuffix(toCol));
+                    String relType    = tableLabel.toUpperCase();
+                    for (Map<String, String> row : table.rows()) {
+                        String fromValue = row.get(fromCol), toValue = row.get(toCol);
+                        if (fromValue == null || fromValue.isBlank() || toValue == null || toValue.isBlank()) continue;
+                        String fromName = fromLabel + "-" + fromValue;
+                        String toName   = toLabel + "-" + toValue;
+                        mergeCsvNode(session, label, fromLabel, fromName, null);
+                        mergeCsvNode(session, label, toLabel, toName, null);
+                        mergeCsvRelationship(session, label, fromName, toName, relType,
+                                rowProperties(row, table.headers(), List.of(fromCol, toCol)));
+                        relationshipsCreated++;
+                        joinRows++;
+                    }
+                } else if (idCols.size() == 1) {
+                    String fkCol = idCols.get(0);
+                    String targetLabel = sanitizeNeo4jName(stripIdentifierSuffix(fkCol));
+                    for (Map<String, String> row : table.rows()) {
+                        String fkValue = row.get(fkCol);
+                        if (fkValue == null || fkValue.isBlank()) continue;
+                        String targetName = targetLabel + "-" + fkValue;
+                        mergeCsvNode(session, label, targetLabel, targetName, null);
+                        tagCsvNode(session, label, targetName, tableLabel,
+                                rowProperties(row, table.headers(), List.of(fkCol)));
+                        tagRows++;
+                    }
+                } else {
+                    String pkCol = table.headers().get(0);
+                    for (Map<String, String> row : table.rows()) {
+                        String idValue = row.get(pkCol);
+                        if (idValue == null || idValue.isBlank()) continue;
+                        String nodeName = tableLabel + "-" + idValue;
+                        mergeCsvNode(session, label, tableLabel, nodeName,
+                                rowProperties(row, table.headers(), List.of(pkCol)));
+                        embedNames.add(nodeName);
+                        embedTexts.add(csvRowSentence(tableLabel, idValue, row, table.headers(), List.of(pkCol)));
+                        lookupRows++;
+                    }
+                }
+            }
+        }
+
+        int embedded = 0;
+        if (!embedNames.isEmpty()) {
+            repository.deleteBySourceTypeAndLabelsAndNameIn(CHUNK_SOURCE_TYPE, label, embedNames); // PostgreSQL
+            for (int i = 0; i < embedNames.size(); i += EMBED_BATCH) {
+                List<String> nameBatch = embedNames.subList(i, Math.min(i + EMBED_BATCH, embedNames.size()));
+                List<String> textBatch = embedTexts.subList(i, Math.min(i + EMBED_BATCH, embedTexts.size()));
+                List<float[]> vectors = jina.embed(textBatch);
+                List<BikeEmbedding> rowsToSave = new ArrayList<>();
+                for (int j = 0; j < nameBatch.size(); j++) {
+                    rowsToSave.add(new BikeEmbedding(
+                            CHUNK_SOURCE_TYPE, label + "_csv_" + Math.abs(nameBatch.get(j).hashCode()),
+                            nameBatch.get(j), label, textBatch.get(j),
+                            floatArrayToVectorString(vectors.get(j)),
+                            "jina", vectors.get(j).length
+                    ));
+                }
+                repository.saveAll(rowsToSave); // PostgreSQL
+                embedded += nameBatch.size();
+            }
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("label", label);
+        result.put("tablesProcessed", tables.size());
+        result.put("entityRows", entityRows);
+        result.put("joinRows", joinRows);
+        result.put("tagRows", tagRows);
+        result.put("lookupRows", lookupRows);
+        result.put("relationshipsCreated", relationshipsCreated);
+        result.put("rowsEmbedded", embedded);
+        result.put("warnings", warnings);
+        return result;
+    }
+
+    private record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
+
+    private void mergeCsvNode(Session session, String label, String nodeLabel, String name,
+                               Map<String, Object> props) {
+        String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
+        String safeType  = nodeLabel.replaceAll("[^a-zA-Z0-9]", "_");
+        session.run(String.format( // Neo4j
+                "MERGE (n:KGNode:`%s`:`%s` {name: $name, sourceLabel: $label}) " +
+                "ON CREATE SET n.nodeType = 'csv_entity' " +
+                "SET n += $props",
+                safeLabel, safeType),
+                Map.of("name", name, "label", label, "props", props != null ? props : Map.of()));
+    }
+
+    private void mergeCsvRelationship(Session session, String label, String fromName, String toName,
+                                       String relType, Map<String, Object> props) {
+        String safeRel = relType.replaceAll("[^A-Za-z0-9]", "_").toUpperCase();
+        session.run(String.format( // Neo4j
+                "MATCH (a:KGNode {name: $from, sourceLabel: $label}) " +
+                "MATCH (b:KGNode {name: $to,   sourceLabel: $label}) " +
+                "MERGE (a)-[r:`%s`]->(b) " +
+                "SET r += $props",
+                safeRel),
+                Map.of("from", fromName, "to", toName, "label", label, "props", props != null ? props : Map.of()));
+    }
+
+    private void tagCsvNode(Session session, String label, String name, String extraLabel,
+                             Map<String, Object> props) {
+        String safeExtra = extraLabel.replaceAll("[^a-zA-Z0-9]", "_");
+        session.run(String.format( // Neo4j
+                "MATCH (n:KGNode {name: $name, sourceLabel: $label}) " +
+                "SET n:`%s` " +
+                "SET n += $props",
+                safeExtra),
+                Map.of("name", name, "label", label, "props", props != null ? props : Map.of()));
+    }
+
+    private static String sanitizeNeo4jName(String s) {
+        return s.replaceAll("[^a-zA-Z0-9]", "_");
+    }
+
+    private static String stripIdentifierSuffix(String column) {
+        return column.replaceAll("(?i)_Identifier$", "");
+    }
+
+    private static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
+                                                       Collection<String> exclude) {
+        Map<String, Object> props = new LinkedHashMap<>();
+        for (String h : headers) {
+            if (exclude.contains(h)) continue;
+            String v = row.get(h);
+            if (v != null && !v.isBlank()) props.put(h, v);
+        }
+        return props;
+    }
+
+    private static String csvRowSentence(String tableLabel, String idValue, Map<String, String> row,
+                                          List<String> headers, Collection<String> keyCols) {
+        StringBuilder sb = new StringBuilder(tableLabel.replace('_', ' ')).append(' ').append(idValue).append(": ");
+        boolean first = true;
+        for (String h : headers) {
+            if (keyCols.contains(h)) continue;
+            String v = row.get(h);
+            if (v == null || v.isBlank()) continue;
+            if (!first) sb.append(", ");
+            sb.append(h.replace('_', ' ')).append(' ').append(v);
+            first = false;
+        }
+        return sb.append('.').toString();
+    }
+
+    // RFC4180-ish: handles quoted fields (commas/quotes inside quotes). First line is headers;
+    // duplicate header names collapse to one key (last value wins) since rows are keyed by a Map.
+    private static List<Map<String, String>> parseCsv(String content) {
+        List<String> lines = Arrays.stream(content.split("\\r?\\n")).filter(l -> !l.isEmpty()).toList();
+        if (lines.size() < 2) return List.of();
+        List<String> headers = splitCsvLine(lines.get(0));
+        List<Map<String, String>> rows = new ArrayList<>();
+        for (int i = 1; i < lines.size(); i++) {
+            List<String> values = splitCsvLine(lines.get(i));
+            Map<String, String> row = new LinkedHashMap<>();
+            for (int c = 0; c < headers.size(); c++) {
+                row.put(headers.get(c), c < values.size() ? values.get(c).trim() : "");
+            }
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<String> splitCsvLine(String line) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') { cur.append('"'); i++; }
+                    else inQuotes = false;
+                } else cur.append(c);
+            } else {
+                if (c == '"') inQuotes = true;
+                else if (c == ',') { fields.add(cur.toString()); cur.setLength(0); }
+                else cur.append(c);
+            }
+        }
+        fields.add(cur.toString());
+        return fields;
+    }
+
     // ── Process ──────────────────────────────────────────────────────────────
 
     public SseEmitter process(List<Map<String, String>> sections, String label) {
