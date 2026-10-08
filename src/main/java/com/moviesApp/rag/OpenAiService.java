@@ -35,7 +35,17 @@ public class OpenAiService {
         this.objectMapper = objectMapper;
     }
 
+    /** Content plus the token usage OpenAI reported for that one call. */
+    public record ChatResult(String content, int promptTokens, int completionTokens, int totalTokens) {}
+
     public String chat(String model, double temperature, int maxTokens, List<Map<String, String>> messages) throws Exception {
+        return chatWithUsage(model, temperature, maxTokens, messages).content();
+    }
+
+    // Single place that actually calls the API and parses the response -- chat(...) above and
+    // every *WithUsage overload below delegate here so there's only one HTTP/parsing path to keep
+    // in sync with OpenAI's response shape.
+    private ChatResult chatWithUsage(String model, double temperature, int maxTokens, List<Map<String, String>> messages) throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
         body.put("temperature", temperature);
@@ -60,7 +70,14 @@ public class OpenAiService {
         List<Map<String, Object>> choices = (List<Map<String, Object>>) parsed.get("choices");
         @SuppressWarnings("unchecked")
         Map<String, Object> message = (Map<String, Object>) choices.get(0).get("message");
-        return (String) message.get("content");
+        String content = (String) message.get("content");
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> usage = (Map<String, Object>) parsed.get("usage");
+        int promptTokens     = usage != null ? ((Number) usage.getOrDefault("prompt_tokens", 0)).intValue() : 0;
+        int completionTokens = usage != null ? ((Number) usage.getOrDefault("completion_tokens", 0)).intValue() : 0;
+        int totalTokens      = usage != null ? ((Number) usage.getOrDefault("total_tokens", 0)).intValue() : 0;
+        return new ChatResult(content, promptTokens, completionTokens, totalTokens);
     }
 
     /** suggestGraph — designModel, caller supplies token budget. */
@@ -71,9 +88,24 @@ public class OpenAiService {
         ));
     }
 
+    /** Same call as chatDesign(String, String, int), but with token usage -- used where the
+     *  caller surfaces per-call usage to the FE (e.g. the grounding check). */
+    public ChatResult chatDesignWithUsage(String systemPrompt, String userContent, int maxTokens) throws Exception {
+        return chatWithUsage(designModel, 0.2, maxTokens, List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user",   "content", userContent)
+        ));
+    }
+
     /** RAG chat with full message history — designModel, caller supplies temperature and token budget. */
     public String chatDesign(double temperature, int maxTokens, List<Map<String, String>> messages) throws Exception {
         return chat(designModel, temperature, maxTokens, messages);
+    }
+
+    /** Same call as chatDesign(double, int, List), but with token usage -- used by the main RAG
+     *  answer call so its usage can be surfaced to the FE. */
+    public ChatResult chatDesignWithUsage(double temperature, int maxTokens, List<Map<String, String>> messages) throws Exception {
+        return chatWithUsage(designModel, temperature, maxTokens, messages);
     }
 
     /** Triple extraction per chunk — extractModel, 2000 token default. */

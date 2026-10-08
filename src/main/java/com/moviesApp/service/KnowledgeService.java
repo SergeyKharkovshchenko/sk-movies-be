@@ -1121,11 +1121,20 @@ public class KnowledgeService {
         List<Map<String, String>> messages = new ArrayList<>(history);
         messages.add(0, Map.of("role", "system", "content", systemPrompt));
 
-        String answer = openAi.chatDesign(
+        OpenAiService.ChatResult answerResult = openAi.chatDesignWithUsage(
                 effectiveTemperature,
                 maxTokens > 0 ? maxTokens : 800,
                 messages
         );
+        String answer = answerResult.content();
+
+        List<Map<String, Object>> tokenUsage = new ArrayList<>();
+        tokenUsage.add(Map.of(
+                "step", "answer generation",
+                "promptTokens", answerResult.promptTokens(),
+                "completionTokens", answerResult.completionTokens(),
+                "totalTokens", answerResult.totalTokens()
+        ));
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("answer",       answer);
@@ -1134,6 +1143,7 @@ public class KnowledgeService {
         result.put("graphContext", graphContext);
         result.put("cypherTrace",  cypherTrace);
         result.put("vectorChunks", vectorChunks);
+        result.put("tokenUsage",   tokenUsage);
         // Strict mode's entire contract is "don't say anything the context doesn't support" --
         // the prompt instructs that, but a prompt is a strong steering signal, not a technical
         // guarantee (observed directly: a model can still state a real-world fact about a
@@ -1143,7 +1153,9 @@ public class KnowledgeService {
         // strict, since non-strict mode explicitly permits labeled inference beyond the context,
         // which this check would otherwise flag as a false positive on every answer.
         if (strict) {
-            result.put("groundingCheck", checkGrounding(answer, contextText));
+            // Appends its own "grounding check" entry to the same tokenUsage list already stored
+            // in `result` above (list is shared by reference, not copied) -- so no second put needed.
+            result.put("groundingCheck", checkGrounding(answer, contextText, tokenUsage));
         }
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
@@ -1199,7 +1211,7 @@ public class KnowledgeService {
      * that couldn't run reports "unknown" (grounded: null) rather than a false "clean" or a false
      * alarm, since the main answer is already generated either way.
      */
-    private Map<String, Object> checkGrounding(String answer, String contextText) {
+    private Map<String, Object> checkGrounding(String answer, String contextText, List<Map<String, Object>> tokenUsage) {
         try {
             String input = String.format("""
                     CONTEXT:
@@ -1208,7 +1220,14 @@ public class KnowledgeService {
                     ANSWER:
                     %s
                     """, contextText, answer);
-            String response = openAi.chatDesign(GROUNDING_CHECK_PROMPT, input, 1000).strip();
+            OpenAiService.ChatResult checkResult = openAi.chatDesignWithUsage(GROUNDING_CHECK_PROMPT, input, 1000);
+            tokenUsage.add(Map.of(
+                    "step", "grounding check",
+                    "promptTokens", checkResult.promptTokens(),
+                    "completionTokens", checkResult.completionTokens(),
+                    "totalTokens", checkResult.totalTokens()
+            ));
+            String response = checkResult.content().strip();
             if (response.startsWith("```")) {
                 response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
             }
