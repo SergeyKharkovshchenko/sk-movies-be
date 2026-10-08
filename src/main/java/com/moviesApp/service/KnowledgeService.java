@@ -36,6 +36,8 @@ public class KnowledgeService {
     private static final int    CHUNK_SIZE     = 1500;
     private static final int    TOP_K          = 5;
     private static final int    NEIGHBOR_LIMIT = 10;
+    private static final int    DEFAULT_MAX_HOPS = 2;
+    private static final int    MAX_HOPS_CAP     = 5;
     private static final int    EMBED_BATCH    = 50;
     private static final String SOURCE_TYPE       = "knowledge_node";
     private static final String CHUNK_SOURCE_TYPE = "chunk_text";
@@ -1011,10 +1013,15 @@ public class KnowledgeService {
     public Map<String, Object> chat(String question, String label,
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens,
-                                    int topK, int neighborLimit, String ragMode, boolean strict,
+                                    int topK, int neighborLimit, int maxHops, String ragMode, boolean strict,
                                     String seedPriority) throws Exception {
         int effectiveTopK          = topK > 0         ? topK         : TOP_K;
         int effectiveNeighborLimit = neighborLimit > 0 ? neighborLimit : NEIGHBOR_LIMIT;
+        // Unlike topK (a flat, single-query LIMIT), each additional hop runs one more Neo4j round
+        // trip PER node discovered by the previous hop -- on a dense graph that's combinatorial,
+        // not linear, so (unlike topK's cap, removed elsewhere by request) this stays clamped
+        // rather than left unbounded.
+        int effectiveMaxHops       = maxHops > 0 ? Math.min(maxHops, MAX_HOPS_CAP) : DEFAULT_MAX_HOPS;
 
         List<Map<String, Object>> graphContext;
         List<String>              seedNodes;
@@ -1039,7 +1046,7 @@ public class KnowledgeService {
 
         } else if ("graph".equals(ragMode)) {
             // Neo4j only — keyword-match node names, expand relationships, skip PostgreSQL
-            graphContext = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, cypherTrace);
+            graphContext = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, effectiveMaxHops, cypherTrace);
             seedNodes    = graphContext.stream()
                     .map(e -> (String) e.getOrDefault("node", ""))
                     .distinct().filter(s -> !s.isEmpty()).collect(Collectors.toList());
@@ -1052,8 +1059,8 @@ public class KnowledgeService {
             List<BikeEmbedding> matches = repository.findSimilarAllTypesByLabel( // PostgreSQL
                     floatArrayToVectorString(vec), label, effectiveTopK);
             vectorChunks.addAll(toVectorChunkEntries(matches));
-            List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit, cypherTrace);
-            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, cypherTrace);
+            List<Map<String, Object>> vectorCtx  = buildGraphContext(matches, label, effectiveNeighborLimit, effectiveMaxHops, cypherTrace);
+            List<Map<String, Object>> keywordCtx = buildKeywordGraphContext(question, label, effectiveTopK, effectiveNeighborLimit, effectiveMaxHops, cypherTrace);
 
             boolean graphFirst = !"vector".equals(seedPriority);
             Stream<Map<String, Object>> first  = graphFirst ? keywordCtx.stream() : vectorCtx.stream();
@@ -1165,7 +1172,8 @@ public class KnowledgeService {
                 "seedNodes",       seedNodes,
                 "contextTriplets", graphContext.size(),
                 "topK",            effectiveTopK,
-                "neighborLimit",   effectiveNeighborLimit
+                "neighborLimit",   effectiveNeighborLimit,
+                "maxHops",         effectiveMaxHops
         ));
         return result;
     }
@@ -1613,9 +1621,10 @@ public class KnowledgeService {
         return rows;
     }
 
-    // graph mode: keyword-match node names in Neo4j, expand 1-hop + 2-hop — no PostgreSQL
+    // graph mode: keyword-match node names in Neo4j, then expand up to maxHops hops out —
+    // no PostgreSQL
     private List<Map<String, Object>> buildKeywordGraphContext(String question, String label,
-                                                               int topK, int neighborLimit,
+                                                               int topK, int neighborLimit, int maxHops,
                                                                List<Map<String, Object>> cypherTrace) {
         List<String> keywords = Arrays.stream(question.toLowerCase().split("\\W+"))
                 .filter(w -> w.length() > 3)
@@ -1654,26 +1663,9 @@ public class KnowledgeService {
                     twoHopSeeds.add(neighborName);
             });
 
-            // 2-hop from entity neighbors
-            int twoHopLimit = Math.max(3, neighborLimit / 4);
-            for (String name : twoHopSeeds) {
-                if (!expanded.add(name)) continue;
-                runTraced(session, "2-hop expansion from \"" + name + "\"",
-                        "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
-                        "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
-                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
-                        "LIMIT $limit",
-                        Map.of("name", name, "label", label, "limit", twoHopLimit),
-                        cypherTrace
-                ).forEach(r -> context.add(Map.of(
-                        "node",         r.get("node").asString(""),
-                        "relationship", r.get("relType").asString(""),
-                        "neighbor",     r.get("neighborName").asString(""),
-                        "neighborText", "",
-                        "neighborDesc", r.get("neighborDesc").asString("")
-                )));
-            }
+            // Hops 2..maxHops from entity neighbors
+            int perHopLimit = Math.max(3, neighborLimit / 4);
+            expandFurtherHops(session, label, twoHopSeeds, expanded, maxHops, perHopLimit, context, cypherTrace);
         } catch (Exception e) {
             context.add(Map.of("error", "Graph keyword search failed: " + e.getMessage()));
         }
@@ -1688,7 +1680,7 @@ public class KnowledgeService {
     }
 
     private List<Map<String, Object>> buildGraphContext(List<BikeEmbedding> matches, String label, int neighborLimit,
-                                                         List<Map<String, Object>> cypherTrace) {
+                                                         int maxHops, List<Map<String, Object>> cypherTrace) {
         List<Map<String, Object>> context = new ArrayList<>();
         Set<String> seedEntityNames = new LinkedHashSet<>();
 
@@ -1750,29 +1742,12 @@ public class KnowledgeService {
             context.add(Map.of("error", "Graph expansion failed: " + e.getMessage()));
         }
 
-        // Pass 3 — 2-hop expand (entity-to-entity only, smaller limit)
-        int twoHopLimit = Math.max(3, neighborLimit / 4);
+        // Pass 3 — hops 2..maxHops expand (entity-to-entity only, smaller limit)
+        int perHopLimit = Math.max(3, neighborLimit / 4);
         try (Session session = driver.session()) { // Neo4j
-            for (String name : twoHopSeeds) {
-                if (!expanded.add(name)) continue;
-                runTraced(session, "2-hop expansion from \"" + name + "\"",
-                        "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
-                        "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
-                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
-                        "LIMIT $limit",
-                        Map.of("name", name, "label", label, "limit", twoHopLimit),
-                        cypherTrace
-                ).forEach(r -> context.add(Map.of(
-                        "node",         r.get("node").asString(""),
-                        "relationship", r.get("relType").asString(""),
-                        "neighbor",     r.get("neighborName").asString(""),
-                        "neighborText", "",
-                        "neighborDesc", r.get("neighborDesc").asString("")
-                )));
-            }
+            expandFurtherHops(session, label, twoHopSeeds, expanded, maxHops, perHopLimit, context, cypherTrace);
         } catch (Exception e) {
-            log.warn("2-hop expansion failed: {}", e.getMessage());
+            log.warn("Further-hop expansion failed: {}", e.getMessage());
         }
 
         Set<String> seen = new LinkedHashSet<>();
@@ -1786,6 +1761,42 @@ public class KnowledgeService {
                             e.getOrDefault("neighbor", ""));
                 })
                 .collect(Collectors.toList());
+    }
+
+    // Beyond the caller's own hop-1 query (which already produced `frontier`, the hop-1 neighbor
+    // names), walks outward up to maxHops total: hop 2 expands from hop 1's neighbors, hop 3 from
+    // hop 2's, and so on, re-tracing nothing already in `alreadyExpanded`. Every pass is
+    // entity-to-entity only (HAS_*/HAS_CHUNK edges excluded) -- those connect structural
+    // scaffolding (sections, chunks), not facts worth walking further from.
+    private void expandFurtherHops(Session session, String label, Set<String> frontier,
+                                   Set<String> alreadyExpanded, int maxHops, int perNodeLimit,
+                                   List<Map<String, Object>> context, List<Map<String, Object>> cypherTrace) {
+        for (int hop = 2; hop <= maxHops && !frontier.isEmpty(); hop++) {
+            Set<String> nextFrontier = new LinkedHashSet<>();
+            for (String name : frontier) {
+                if (!alreadyExpanded.add(name)) continue;
+                runTraced(session, hop + "-hop expansion from \"" + name + "\"",
+                        "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
+                        "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
+                        "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
+                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "LIMIT $limit",
+                        Map.of("name", name, "label", label, "limit", perNodeLimit),
+                        cypherTrace
+                ).forEach(r -> {
+                    String neighborName = r.get("neighborName").asString("");
+                    context.add(Map.of(
+                            "node",         r.get("node").asString(""),
+                            "relationship", r.get("relType").asString(""),
+                            "neighbor",     neighborName,
+                            "neighborText", "",
+                            "neighborDesc", r.get("neighborDesc").asString("")
+                    ));
+                    if (!alreadyExpanded.contains(neighborName)) nextFrontier.add(neighborName);
+                });
+            }
+            frontier = nextFrontier;
+        }
     }
 
     private String buildContextString(List<Map<String, Object>> context, String label) {
