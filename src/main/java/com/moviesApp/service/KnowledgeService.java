@@ -51,6 +51,7 @@ public class KnowledgeService {
     private final OpenAiService           openAi;
     private final ObjectMapper            objectMapper;
     private final CacheManager            cacheManager;
+    private final TriplyService           triply;
     private final ExecutorService         executor = Executors.newCachedThreadPool();
 
     public KnowledgeService(
@@ -60,7 +61,8 @@ public class KnowledgeService {
             EntityExtractorService extractor,
             OpenAiService openAi,
             ObjectMapper objectMapper,
-            CacheManager cacheManager) {
+            CacheManager cacheManager,
+            TriplyService triply) {
         this.driver       = driver;
         this.repository   = repository;
         this.jina         = jina;
@@ -68,6 +70,7 @@ public class KnowledgeService {
         this.openAi       = openAi;
         this.objectMapper = objectMapper;
         this.cacheManager = cacheManager;
+        this.triply       = triply;
     }
 
     // ── Suggest sections ─────────────────────────────────────────────────────
@@ -556,6 +559,7 @@ public class KnowledgeService {
                     }
                 }
 
+                triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
                 long nodeCount = countNodes(label);
                 send(emitter, "complete", Map.of(
                         "label", label,
@@ -731,6 +735,8 @@ public class KnowledgeService {
                 embedded += nameBatch.size();
             }
         }
+
+        triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("label", label);
@@ -988,6 +994,7 @@ public class KnowledgeService {
                     ));
                 }
 
+                triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
                 long nodeCount = countNodes(label);
                 send(emitter, "complete", Map.of(
                         "label", label,
@@ -1348,6 +1355,7 @@ public class KnowledgeService {
             session.run("MATCH (n:KGNode {sourceLabel: $label}) DETACH DELETE n", Map.of("label", label));
         }
         repository.deleteAllByLabels(label); // PostgreSQL — clears knowledge_node + chunk_text
+        triply.deleteGraphAsync(label); // TriplyDB — drops the mirrored named graph
         KNOWLEDGE_CACHES.forEach(name -> {
             var cache = cacheManager.getCache(name);
             if (cache != null) cache.clear();

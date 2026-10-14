@@ -74,6 +74,9 @@ NEO4J_PASSWORD
 MONGODB_URI          # configured but unused
 MONGODB_DATABASE
 JINA_API_KEY         # currently hardcoded in UserService — move to env
+TRIPLY_TOKEN         # optional; enables TriplyDB mirror of knowledge graphs (TriplyService)
+TRIPLY_ACCOUNT       # default Kharkovchenko
+TRIPLY_DATASET       # default sk-knowledge (auto-created, one named graph per knowledge-base label)
 ```
 
 ## Known Issues / Tech Debt
