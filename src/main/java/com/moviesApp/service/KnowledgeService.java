@@ -9,9 +9,14 @@ import com.moviesApp.rag.EntityExtractorService.Triple;
 import com.moviesApp.rag.JinaEmbeddingProvider;
 import com.moviesApp.rag.OpenAiService;
 import com.moviesApp.repositories.BikeEmbeddingRepository;
+import org.neo4j.driver.AccessMode;
 import org.neo4j.driver.Driver;
+import org.neo4j.driver.Query;
 import org.neo4j.driver.Record;
+import org.neo4j.driver.Result;
 import org.neo4j.driver.Session;
+import org.neo4j.driver.SessionConfig;
+import org.neo4j.driver.TransactionConfig;
 import org.neo4j.driver.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1766,7 +1771,7 @@ public class KnowledgeService {
                                     List<Map<String, String>> history,
                                     double temperature, int maxTokens,
                                     int topK, int neighborLimit, int maxHops, String ragMode, boolean strict,
-                                    String seedPriority) throws Exception {
+                                    String seedPriority, boolean text2cypher) throws Exception {
         int effectiveTopK          = topK > 0         ? topK         : TOP_K;
         int effectiveNeighborLimit = neighborLimit > 0 ? neighborLimit : NEIGHBOR_LIMIT;
         // Unlike topK (a flat, single-query LIMIT), each additional hop runs one more Neo4j round
@@ -1841,6 +1846,20 @@ public class KnowledgeService {
             contextText = buildContextString(graphContext, label);
         }
 
+        List<Map<String, Object>> tokenUsage = new ArrayList<>();
+
+        // Text-to-Cypher: retrieval hands the model a neighbourhood of facts, which is the wrong
+        // tool for counts, rankings, averages and negation over the whole knowledge base (it has
+        // to find and combine every relevant fact itself, and the context may not hold them all).
+        // An LLM-written read-only query computes those exactly; its result goes at the top of the
+        // context, with the retrieved facts kept below for detail.
+        Map<String, Object> text2cypherResult = null;
+        if (text2cypher && !"vector".equals(ragMode)) {
+            text2cypherResult = runText2Cypher(question, label, cypherTrace, tokenUsage);
+            Object block = text2cypherResult.remove("contextBlock");
+            if (block instanceof String b) contextText = b + "\n\n" + contextText;
+        }
+
         // Relationships whose predicate is prefixed POSSIBLE_ (e.g. POSSIBLE_CAUSED, POSSIBLE_REASON_FOR)
         // are inferred connections the extractor reasoned out, not sentences taken verbatim from the
         // source. Both modes are told how to handle that distinction — strict mode may state them but
@@ -1854,6 +1873,14 @@ public class KnowledgeService {
                 "'Possible consequence (inferred, not explicitly stated): ...'. Never present an inferred " +
                 "connection as if the source text stated it outright.";
 
+        // Only mentioned when the block is actually there -- otherwise the model starts quoting a
+        // "QUERY RESULT" it was never given.
+        String queryResultHandling = contextText.startsWith("QUERY RESULT")
+                ? "The context starts with a QUERY RESULT section: an exact computation over the whole " +
+                  "knowledge base. Base counts, totals, rankings, lists and negation on it, and use the " +
+                  "remaining context only for supporting detail. "
+                : "";
+
         // strict=true: model must answer only from context, no pre-training knowledge allowed.
         // strict=false (default): model may supplement with general knowledge when context is thin.
         String systemPrompt = strict
@@ -1861,10 +1888,18 @@ public class KnowledgeService {
                   "Answer using ONLY the exact facts stated in the context below. " +
                   "Do not add background, explanation, or any information not explicitly present in the context. " +
                   "Do not say 'however' or 'historically' or reference any outside knowledge. " +
-                  "If the answer cannot be found in the context, output exactly this and nothing else: " +
-                  "'Not in knowledge base.' " + possibleRelHandling + "\n\nContext:\n" + contextText
+                  // Counting/ranking questions used to flip between an answer and a refusal: a
+                  // computed result is never "stated" verbatim, so a literal reading of the rule
+                  // above forbids it. Spell out that computing over the given facts is allowed.
+                  "Computing over the facts in the context IS answering from the context: you may count, " +
+                  "compare, rank, filter, intersect, average, and conclude that something is absent when " +
+                  "no fact in the context supports it. When you do, list the facts you computed from " +
+                  "(e.g. the dishes you counted) so the result can be checked. Answer in plain sentences " +
+                  "or a short list, never by copying raw rows. " + queryResultHandling +
+                  "If the answer cannot be found in or computed from the context, output exactly this and " +
+                  "nothing else: 'Not in knowledge base.' " + possibleRelHandling + "\n\nContext:\n" + contextText
                 : "You are a knowledgeable assistant. Use the following knowledge graph context to answer accurately. " +
-                  "If the answer is not in the context, say so honestly. " +
+                  "If the answer is not in the context, say so honestly. " + queryResultHandling +
                   "You may also go beyond what's directly stated and reason out likely reasons, causes, or " +
                   "consequences that the context strongly implies but doesn't say outright — as long as you " +
                   "clearly label any such reasoning as a possible/inferred conclusion, separate from stated facts, " +
@@ -1887,7 +1922,6 @@ public class KnowledgeService {
         );
         String answer = answerResult.content();
 
-        List<Map<String, Object>> tokenUsage = new ArrayList<>();
         tokenUsage.add(Map.of(
                 "step", "answer generation",
                 "promptTokens", answerResult.promptTokens(),
@@ -1903,6 +1937,7 @@ public class KnowledgeService {
         result.put("cypherTrace",  cypherTrace);
         result.put("vectorChunks", vectorChunks);
         result.put("tokenUsage",   tokenUsage);
+        if (text2cypherResult != null) result.put("text2cypher", text2cypherResult);
         // Strict mode's entire contract is "don't say anything the context doesn't support" --
         // the prompt instructs that, but a prompt is a strong steering signal, not a technical
         // guarantee (observed directly: a model can still state a real-world fact about a
@@ -1914,7 +1949,11 @@ public class KnowledgeService {
         if (strict) {
             // Appends its own "grounding check" entry to the same tokenUsage list already stored
             // in `result` above (list is shared by reference, not copied) -- so no second put needed.
-            result.put("groundingCheck", checkGrounding(answer, contextText, tokenUsage));
+            Map<String, Object> grounding = checkGrounding(answer, contextText, tokenUsage);
+            if (text2cypherResult != null && text2cypherResult.get("rows") instanceof List<?> rows) {
+                grounding = clearClaimsVerifiedByQuery(grounding, rows);
+            }
+            result.put("groundingCheck", grounding);
         }
         result.put("retrievalInfo", Map.of(
                 "mode",            ragMode,
@@ -1925,9 +1964,278 @@ public class KnowledgeService {
                 "contextTriplets", graphContext.size(),
                 "topK",            effectiveTopK,
                 "neighborLimit",   effectiveNeighborLimit,
-                "maxHops",         effectiveMaxHops
+                "maxHops",         effectiveMaxHops,
+                "text2cypher",     text2cypherResult != null
         ));
         return result;
+    }
+
+    // ── Text-to-Cypher ────────────────────────────────────────────────────────
+
+    private static final String TEXT2CYPHER_PROMPT = """
+            You translate a question into ONE read-only Neo4j Cypher query over a knowledge graph.
+            You get the graph SCHEMA: node types with their property keys and entity names, and the
+            relationship patterns that exist between node types.
+
+            Rules:
+            - Every node pattern MUST include {sourceLabel: $label} -- the database holds several
+              knowledge bases and $label selects this one. Use the KGNode label plus a node type,
+              e.g. (d:KGNode:Dish {sourceLabel: $label}).
+            - Read-only: MATCH, OPTIONAL MATCH, WHERE, WITH, UNWIND, RETURN, ORDER BY, LIMIT and
+              EXISTS { } / COUNT { } subqueries only.
+            - Refer to entities by their exact names from the schema (case-sensitive), e.g.
+              {name: 'gluten'}.
+            - Relationship types ending in _CATEGORY are precomputed shortcuts: (a)-[:X_CATEGORY]->(c)
+              means a reaches category c through any depth of IS_A. Prefer them for category
+              questions ("contains dairy", "vegetarian", "allergy") over IS_A* paths.
+            - Return only the values the answer needs, with readable aliases -- names, counts,
+              numbers -- never whole nodes. Use RETURN DISTINCT for lists. For counts, rankings and
+              averages also return the items the value was computed from, e.g.
+              collect(DISTINCT d.name) AS dishes. LIMIT 100 at most.
+            - A concept that is not a node name ("vegetarian", "vegan", "safe for a nut allergy",
+              "without X") must be expressed through the categories that define it, using the
+              CATEGORY HIERARCHY: vegetarian = contains nothing under meat or seafood; vegan =
+              contains nothing under the animal-product category; "safe for X" = contains nothing
+              under X. Pick the broadest category that covers the concept.
+            - Negation goes on the entity you return, never on one of its parts:
+              MATCH (d:KGNode:Dish {sourceLabel: $label})
+              WHERE NOT EXISTS { (d)-[:INCLUDES_INGREDIENT_CATEGORY]->(:KGNode {sourceLabel: $label, name: 'meat'}) }
+              -- not "ingredients that are not meat", which matches every dish with a vegetable.
+            - If the schema cannot answer the question, set "cypher" to null.
+
+            Return ONLY a valid JSON object -- no markdown, no explanation:
+            {"cypher": "<query or null>"}
+            """;
+
+    private static final Pattern CYPHER_WRITE_CLAUSE = Pattern.compile(
+            "(?i)\\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|FOREACH|CALL|LOAD\\s+CSV|USE)\\b");
+    private static final int TEXT2CYPHER_MAX_ROWS = 100;
+
+    // label|question|schema-hash -> a query that ran successfully. OpenAI's seed is only
+    // best-effort, so regenerating can yield a slightly different query (and so a differently
+    // worded answer) for the same question; reusing the first good one keeps repeats identical.
+    // The schema hash invalidates it as soon as the knowledge base's data changes.
+    private final com.github.benmanes.caffeine.cache.Cache<String, String> text2cypherCache =
+            com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(500).build();
+
+    /**
+     * Has the LLM write one read-only query for the question, runs it, and returns
+     * {cypher, columns, rows, rowCount, attempts, error?} plus a "contextBlock" for the answer
+     * prompt. Guarded three ways: the query must reference $label (so it stays inside this
+     * knowledge base), write clauses are rejected before it runs, and it runs in a READ-access
+     * session with a timeout, so even a query that slips past the check can't modify anything.
+     * One retry feeds a failing query's error back to the LLM.
+     */
+    private Map<String, Object> runText2Cypher(String question, String label,
+                                               List<Map<String, Object>> cypherTrace,
+                                               List<Map<String, Object>> tokenUsage) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        String schema;
+        try {
+            schema = describeSchema(label);
+        } catch (Exception e) {
+            out.put("error", "schema lookup failed: " + e.getMessage());
+            return out;
+        }
+
+        String cacheKey = label + "|" + question.trim().toLowerCase(Locale.ROOT) + "|" + schema.hashCode();
+        String feedback = "";
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            out.put("attempts", attempt);
+            String cypher = attempt == 1 ? text2cypherCache.getIfPresent(cacheKey) : null;
+            try {
+                if (cypher != null) {
+                    out.put("cached", true);
+                } else {
+                    OpenAiService.ChatResult gen = openAi.chatDesignWithUsage(0.0, 1500, List.of(
+                            Map.of("role", "system", "content", TEXT2CYPHER_PROMPT),
+                            Map.of("role", "user", "content", "SCHEMA:\n" + schema + "\nQUESTION: " + question + feedback)));
+                    tokenUsage.add(Map.of(
+                            "step", "text-to-cypher" + (attempt > 1 ? " (retry)" : ""),
+                            "promptTokens", gen.promptTokens(),
+                            "completionTokens", gen.completionTokens(),
+                            "totalTokens", gen.totalTokens()));
+                    String response = gen.content().strip();
+                    if (response.startsWith("```")) {
+                        response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+                    }
+                    Object raw = asMap(objectMapper.readValue(response, Map.class)).get("cypher");
+                    if (!(raw instanceof String s) || s.isBlank()) {
+                        out.put("cypher", null);
+                        out.put("error", "the question can't be answered from this graph's schema");
+                        return out;
+                    }
+                    cypher = s.strip().replaceAll(";\\s*$", "");
+                }
+                out.put("cypher", cypher);
+                if (cypher.contains(";")) throw new IllegalArgumentException("only a single statement is allowed");
+                if (CYPHER_WRITE_CLAUSE.matcher(cypher).find()) throw new IllegalArgumentException("write clauses are not allowed");
+                if (!cypher.contains("$label")) throw new IllegalArgumentException("query must filter nodes by {sourceLabel: $label}");
+
+                List<String> columns;
+                List<Map<String, Object>> rows = new ArrayList<>();
+                try (Session session = driver.session(SessionConfig.builder()
+                        .withDefaultAccessMode(AccessMode.READ).build())) { // Neo4j, read-only
+                    Result res = session.run(new Query(cypher, Map.of("label", label)),
+                            TransactionConfig.builder().withTimeout(java.time.Duration.ofSeconds(15)).build());
+                    columns = res.keys();
+                    while (res.hasNext() && rows.size() < TEXT2CYPHER_MAX_ROWS) {
+                        Record r = res.next();
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (String col : columns) row.put(col, plainValue(r.get(col)));
+                        rows.add(row);
+                    }
+                }
+                cypherTrace.add(Map.of("stage", "text-to-cypher", "query", cypher,
+                        "params", Map.of("label", label), "resultCount", rows.size()));
+                text2cypherCache.put(cacheKey, cypher);
+                out.remove("error");
+                out.put("columns", columns);
+                out.put("rows", rows);
+                out.put("rowCount", rows.size());
+
+                StringBuilder block = new StringBuilder(
+                        "QUERY RESULT (exact Cypher computation over the whole knowledge base):\n")
+                        .append("Query: ").append(cypher).append('\n');
+                if (rows.isEmpty()) {
+                    block.append("The query returned no rows -- nothing in the knowledge base matches it.\n");
+                } else {
+                    for (Map<String, Object> row : rows) block.append(objectMapper.writeValueAsString(row)).append('\n');
+                }
+                out.put("contextBlock", block.toString());
+                return out;
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                out.put("error", msg);
+                log.warn("[text2cypher] attempt {} failed: {}", attempt, msg);
+                feedback = "\n\nYOUR PREVIOUS QUERY FAILED -- fix it:\n" + cypher + "\nError: " + msg;
+            }
+        }
+        return out;
+    }
+
+    /** Compact schema for the Text-to-Cypher prompt: node types (props, names) and relationship patterns. */
+    private String describeSchema(String label) {
+        String safeLabel = sanitizeNeo4jName(label);
+        StringBuilder sb = new StringBuilder("Node types:\n");
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (n:KGNode {sourceLabel: $l}) WHERE NOT n:Chunk AND NOT n:Section " +
+                    "UNWIND [x IN labels(n) WHERE x <> 'KGNode' AND x <> $safe] AS t " +
+                    "WITH t, count(n) AS c, collect(n.name) AS names, collect(keys(n)) AS ks " +
+                    "RETURN t, c, names, reduce(acc = [], k IN reduce(f = [], l IN ks | f + l) | " +
+                    "       CASE WHEN k IN acc THEN acc ELSE acc + k END) AS props ORDER BY t",
+                    Map.of("l", label, "safe", safeLabel)
+            ).forEachRemaining(r -> {
+                List<String> names = new ArrayList<>(r.get("names").asList(Value::asString));
+                Collections.sort(names);
+                List<String> props = new ArrayList<>(r.get("props").asList(Value::asString));
+                props.removeAll(List.of("sourceLabel", "nodeType", "csvTables", "inferredBy"));
+                Collections.sort(props);
+                sb.append("- ").append(r.get("t").asString()).append(" (").append(r.get("c").asLong())
+                        .append(" nodes; properties: ").append(String.join(", ", props)).append(")\n")
+                        .append("  names: ").append(String.join(", ", names.subList(0, Math.min(80, names.size()))))
+                        .append(names.size() > 80 ? ", ..." : "").append('\n');
+            });
+            sb.append("Relationship patterns (count):\n");
+            session.run(
+                    "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
+                    "WHERE NOT a:Chunk AND NOT b:Chunk " +
+                    "WITH [x IN labels(a) WHERE x <> 'KGNode' AND x <> $safe][0] AS from, type(r) AS rel, " +
+                    "     [x IN labels(b) WHERE x <> 'KGNode' AND x <> $safe][0] AS to, count(*) AS c " +
+                    "RETURN from, rel, to, c ORDER BY c DESC, rel, from, to LIMIT 60",
+                    Map.of("l", label, "safe", safeLabel)
+            ).forEachRemaining(r -> sb.append("- (").append(r.get("from").asString("?")).append(")-[:")
+                    .append(r.get("rel").asString()).append("]->(").append(r.get("to").asString("?"))
+                    .append(") x").append(r.get("c").asLong()).append('\n'));
+
+            // The IS_A tree (broad -> specific) with leaves summarised as counts -- lets the model
+            // map a concept like "vegan" onto the right broad category instead of guessing.
+            Map<String, String> parentOf = new HashMap<>();
+            session.run(
+                    "MATCH (c:KGNode {sourceLabel: $l})-[:IS_A]->(p:KGNode {sourceLabel: $l}) RETURN c.name AS c, p.name AS p",
+                    Map.of("l", label)
+            ).forEachRemaining(r -> parentOf.putIfAbsent(r.get("c").asString(), r.get("p").asString()));
+            if (!parentOf.isEmpty()) {
+                Map<String, List<String>> childrenOf = membersOf(parentOf);
+                sb.append("Category hierarchy (IS_A, broad -> specific; leaf items counted):\n");
+                for (String root : rootsOf(parentOf)) appendCategoryTree(sb, root, childrenOf, 0, new HashSet<>());
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void appendCategoryTree(StringBuilder sb, String node, Map<String, List<String>> childrenOf,
+                                           int depth, Set<String> path) {
+        if (!path.add(node)) return;
+        List<String> kids = childrenOf.getOrDefault(node, List.of());
+        List<String> leaves = kids.stream().filter(k -> !childrenOf.containsKey(k)).toList();
+        sb.append("  ".repeat(depth + 1)).append(node);
+        if (!leaves.isEmpty()) sb.append(" (").append(leaves.size()).append(" items, e.g. ")
+                .append(String.join(", ", leaves.subList(0, Math.min(3, leaves.size())))).append(')');
+        sb.append('\n');
+        for (String k : kids) if (childrenOf.containsKey(k)) appendCategoryTree(sb, k, childrenOf, depth + 1, path);
+        path.remove(node);
+    }
+
+    /** Neo4j value -> JSON-friendly Java value (nodes become their name, relationships their type). */
+    private static Object plainValue(Value v) {
+        if (v == null || v.isNull()) return null;
+        switch (v.type().name()) {
+            case "NODE": {
+                var node = v.asNode();
+                return node.containsKey("name") ? node.get("name").asString() : node.elementId();
+            }
+            case "RELATIONSHIP": return v.asRelationship().type();
+            case "PATH": {
+                List<Object> parts = new ArrayList<>();
+                v.asPath().nodes().forEach(n -> parts.add(n.containsKey("name") ? n.get("name").asString() : n.elementId()));
+                return parts;
+            }
+            case "LIST": return v.asList(KnowledgeService::plainValue);
+            case "MAP": {
+                Map<String, Object> m = new LinkedHashMap<>();
+                v.asMap(KnowledgeService::plainValue).forEach(m::put);
+                return m;
+            }
+            default: return v.asObject();
+        }
+    }
+
+    /**
+     * The LLM checker reliably flags items an exact query returned (e.g. a dish name) when the
+     * retrieved facts beside it happen not to mention them -- even when told the query result is
+     * authoritative. A flagged claim that is nothing more than a value from the query rows is
+     * verified by the query itself, so clear it deterministically; anything asserting more than
+     * that (a different price, an extra property) is left for the LLM's verdict.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> clearClaimsVerifiedByQuery(Map<String, Object> grounding, List<?> rows) {
+        if (!(grounding.get("unsupportedClaims") instanceof List<?> claims) || claims.isEmpty()) return grounding;
+        Set<String> values = new HashSet<>();
+        for (Object row : rows) {
+            if (row instanceof Map<?, ?> m) collectPlainValues(m.values(), values);
+        }
+        List<String> remaining = new ArrayList<>(), verified = new ArrayList<>();
+        for (Object c : claims) {
+            String claim = String.valueOf(c);
+            String norm = claim.toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}.]+", " ").trim();
+            if (values.contains(norm)) verified.add(claim); else remaining.add(claim);
+        }
+        if (verified.isEmpty()) return grounding;
+        Map<String, Object> out = new LinkedHashMap<>(grounding);
+        out.put("unsupportedClaims", remaining);
+        out.put("grounded", remaining.isEmpty());
+        out.put("verifiedByQuery", verified);
+        return out;
+    }
+
+    private static void collectPlainValues(Collection<?> in, Set<String> out) {
+        for (Object v : in) {
+            if (v instanceof Collection<?> c) collectPlainValues(c, out);
+            else if (v instanceof Map<?, ?> m) collectPlainValues(m.values(), out);
+            else if (v != null) out.add(String.valueOf(v).toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}.]+", " ").trim());
+        }
     }
 
     private static final String GROUNDING_CHECK_PROMPT = """
@@ -1958,6 +2266,16 @@ public class KnowledgeService {
               everything the context states, even though no single sentence spells out the word
               "only" or the number. Do not flag correct reasoning over the full context as
               unsupported just because the conclusion itself isn't stated verbatim somewhere.
+            - The same holds for every other computation over context facts: a ranking or
+              maximum ("cuisine X has the most ..."), an average or sum, a filter ("dishes under
+              10 EUR"), an intersection, or an absence ("no Thai dish contains shellfish") is
+              grounded when it correctly follows from the facts in the context. Check the
+              arithmetic and flag it only if it is actually wrong or rests on a missing fact.
+            - An AUTHORITATIVE QUERY RESULT section is an exact computation over the whole knowledge
+              base: every item it returns has the property its query selects for (e.g. a query
+              filtering dishes to those with both dairy and gluten proves each returned dish has
+              both). A claim that matches it is grounded. CONTEXT is only a partial sample of facts
+              -- a fact missing from CONTEXT is never evidence against the query result.
             - If the answer correctly declines to answer (e.g. "Not in knowledge base."), grounded
               is true and unsupportedClaims is empty.
             - Quote each unsupported claim close to how the answer phrased it, so it's clear which
@@ -1973,14 +2291,40 @@ public class KnowledgeService {
      */
     private Map<String, Object> checkGrounding(String answer, String contextText, List<Map<String, Object>> tokenUsage) {
         try {
-            String input = String.format("""
+            // A Text-to-Cypher result leads the context; hand it over as its own section, or the
+            // checker weighs each claim against the (deliberately partial) retrieved facts below it
+            // and flags items only the query result lists.
+            String queryResult = "";
+            String facts = contextText;
+            if (contextText.startsWith("QUERY RESULT")) {
+                int split = contextText.indexOf("\n\n");
+                queryResult = split < 0 ? contextText : contextText.substring(0, split);
+                facts = split < 0 ? "" : contextText.substring(split + 2);
+            }
+            String input = queryResult.isEmpty()
+                    ? String.format("""
                     CONTEXT:
                     %s
 
                     ANSWER:
                     %s
-                    """, contextText, answer);
-            OpenAiService.ChatResult checkResult = openAi.chatDesignWithUsage(GROUNDING_CHECK_PROMPT, input, 1000);
+                    """, contextText, answer)
+                    : String.format("""
+                    AUTHORITATIVE QUERY RESULT (exact computation over the whole knowledge base --
+                    every item and value listed here is supported, even if CONTEXT below doesn't
+                    mention it):
+                    %s
+
+                    CONTEXT:
+                    %s
+
+                    ANSWER:
+                    %s
+                    """, queryResult, facts, answer);
+            // Temperature 0 (+ the fixed seed it implies) so the same answer gets the same verdict.
+            OpenAiService.ChatResult checkResult = openAi.chatDesignWithUsage(0.0, 1000, List.of(
+                    Map.of("role", "system", "content", GROUNDING_CHECK_PROMPT),
+                    Map.of("role", "user", "content", input)));
             tokenUsage.add(Map.of(
                     "step", "grounding check",
                     "promptTokens", checkResult.promptTokens(),
@@ -2396,7 +2740,7 @@ public class KnowledgeService {
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                     "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
-                    "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
+                    "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit),
                     cypherTrace
@@ -2449,7 +2793,7 @@ public class KnowledgeService {
                             "MATCH (c:KGNode {name: $name, sourceLabel: $label})" +
                             "<-[:HAS_CHUNK]-(s:KGNode)<-[r]-(e:KGNode {sourceLabel: $label}) " +
                             "WHERE NOT e.nodeType IN ['section','chunk'] " +
-                            "RETURN e.name AS entityName LIMIT 1",
+                            "RETURN e.name AS entityName ORDER BY entityName LIMIT 1",
                             Map.of("name", match.getName(), "label", label),
                             cypherTrace
                     );
@@ -2485,7 +2829,7 @@ public class KnowledgeService {
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                         "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
-                        "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC " +
+                        "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", neighborLimit),
                         cypherTrace
@@ -2545,6 +2889,7 @@ public class KnowledgeService {
                         "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
                         "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "ORDER BY CASE WHEN type(r) STARTS WITH 'IS_A' THEN 0 ELSE 1 END, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", perNodeLimit),
                         cypherTrace
