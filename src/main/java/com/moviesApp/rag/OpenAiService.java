@@ -16,6 +16,7 @@ import java.util.Map;
 public class OpenAiService {
 
     private static final String API_URL = "https://api.openai.com/v1/chat/completions";
+    private static final int    DETERMINISTIC_SEED = 42;
 
     @Value("${OPENAI_API_KEY}")
     private String apiKey;
@@ -49,6 +50,10 @@ public class OpenAiService {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", model);
         body.put("temperature", temperature);
+        // Temperature 0 alone isn't deterministic on OpenAI's side; a fixed seed makes repeated
+        // identical requests return (best-effort) identical output, which is what callers asking
+        // for greedy decoding -- strict RAG answers, JSON extraction -- actually want.
+        if (temperature == 0.0) body.put("seed", DETERMINISTIC_SEED);
         body.put("max_tokens", maxTokens);
         body.put("messages", messages);
 

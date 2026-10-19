@@ -190,9 +190,10 @@ public class KnowledgeController {
             String  ragMode       = String.valueOf(body.getOrDefault("ragMode", "combined"));
             boolean strict        = Boolean.TRUE.equals(body.get("strict"));
             String  seedPriority  = String.valueOf(body.getOrDefault("seedPriority", "graph"));
+            boolean text2cypher   = Boolean.TRUE.equals(body.get("text2cypher"));
 
             return ResponseEntity.ok(
-                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit, maxHops, ragMode, strict, seedPriority));
+                    knowledgeService.chat(question, label, messages, temperature, maxTokens, topK, neighborLimit, maxHops, ragMode, strict, seedPriority, text2cypher));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
