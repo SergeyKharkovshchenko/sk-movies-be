@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -335,11 +336,17 @@ public class KnowledgeService {
         return Map.of("count", validPairs.size(), "pairs", validPairs);
     }
 
-    /** Parent-child pairs only, for the FE's collapsible hierarchy tree view. */
+    /**
+     * Parent-child pairs only, for the FE's collapsible hierarchy tree view -- from the text flow's
+     * taxonomy step (parent)-[:PARENT_OF]->(child) and from CSV hierarchy columns (child)-[:IS_A]->(parent).
+     */
     public List<Relation> hierarchy(String label) {
         try (Session session = driver.session()) { // Neo4j
             return session.run(
                     "MATCH (p:KGNode {sourceLabel: $l})-[:PARENT_OF]->(c:KGNode {sourceLabel: $l}) " +
+                            "RETURN p.name AS parent, c.name AS child " +
+                            "UNION " +
+                            "MATCH (c:KGNode {sourceLabel: $l})-[:IS_A]->(p:KGNode {sourceLabel: $l}) " +
                             "RETURN p.name AS parent, c.name AS child",
                     Map.of("l", label)
             ).list(r -> new Relation(r.get("parent").asString(), r.get("child").asString()));
@@ -631,6 +638,16 @@ public class KnowledgeService {
             tables.add(new CsvTable(tableName, new ArrayList<>(rows.get(0).keySet()), rows));
         }
 
+        // Without a single "*_Identifier" column anywhere in the batch, the naming convention below
+        // has nothing to go on and would turn every row into an isolated lookup node -- infer the
+        // column roles from the data instead. Mixed batches keep the convention path untouched, so
+        // convention-style lookup tables (e.g. Party_Role.csv) still link the way they always have.
+        boolean conventionBatch = tables.stream()
+                .anyMatch(t -> t.headers().stream().anyMatch(h -> h.endsWith("_Identifier")));
+        if (!conventionBatch) {
+            return importCsvInferred(label, tables, warnings);
+        }
+
         int entityRows = 0, joinRows = 0, tagRows = 0, lookupRows = 0, relationshipsCreated = 0;
         List<String> embedNames = new ArrayList<>();
         List<String> embedTexts = new ArrayList<>();
@@ -715,26 +732,9 @@ public class KnowledgeService {
             }
         }
 
-        int embedded = 0;
-        if (!embedNames.isEmpty()) {
-            repository.deleteBySourceTypeAndLabelsAndNameIn(CHUNK_SOURCE_TYPE, label, embedNames); // PostgreSQL
-            for (int i = 0; i < embedNames.size(); i += EMBED_BATCH) {
-                List<String> nameBatch = embedNames.subList(i, Math.min(i + EMBED_BATCH, embedNames.size()));
-                List<String> textBatch = embedTexts.subList(i, Math.min(i + EMBED_BATCH, embedTexts.size()));
-                List<float[]> vectors = jina.embed(textBatch);
-                List<BikeEmbedding> rowsToSave = new ArrayList<>();
-                for (int j = 0; j < nameBatch.size(); j++) {
-                    rowsToSave.add(new BikeEmbedding(
-                            CHUNK_SOURCE_TYPE, label + "_csv_" + Math.abs(nameBatch.get(j).hashCode()),
-                            nameBatch.get(j), label, textBatch.get(j),
-                            floatArrayToVectorString(vectors.get(j)),
-                            "jina", vectors.get(j).length
-                    ));
-                }
-                repository.saveAll(rowsToSave); // PostgreSQL
-                embedded += nameBatch.size();
-            }
-        }
+        List<String> embedIds = embedNames.stream()
+                .map(n -> label + "_csv_" + Math.abs(n.hashCode())).toList();
+        int embedded = embedCsvRows(label, embedNames, embedIds, embedTexts);
 
         triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
 
@@ -752,6 +752,365 @@ public class KnowledgeService {
     }
 
     private record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
+
+    private int embedCsvRows(String label, List<String> names, List<String> ids, List<String> texts) throws Exception {
+        if (names.isEmpty()) return 0;
+        repository.deleteBySourceTypeAndLabelsAndNameIn(CHUNK_SOURCE_TYPE, label, names); // PostgreSQL
+        int embedded = 0;
+        for (int i = 0; i < names.size(); i += EMBED_BATCH) {
+            int end = Math.min(i + EMBED_BATCH, names.size());
+            List<String> textBatch = texts.subList(i, end);
+            List<float[]> vectors = jina.embed(textBatch);
+            List<BikeEmbedding> rowsToSave = new ArrayList<>();
+            for (int j = 0; j < textBatch.size(); j++) {
+                rowsToSave.add(new BikeEmbedding(
+                        CHUNK_SOURCE_TYPE, ids.get(i + j),
+                        names.get(i + j), label, textBatch.get(j),
+                        floatArrayToVectorString(vectors.get(j)),
+                        "jina", vectors.get(j).length
+                ));
+            }
+            repository.saveAll(rowsToSave); // PostgreSQL
+            embedded += textBatch.size();
+        }
+        return embedded;
+    }
+
+    // ── Import CSV (inferred, for tables without "*_Identifier" columns) ──────────
+    //
+    // Plain CSVs such as `dish,cuisine,price_eur,ingredients` or `child,child_type,parent` carry
+    // their structure in the data rather than in column names, so each column gets a role from
+    // its name and values:
+    //   - key:       the first column; each row is one node, named by the bare value (no table
+    //                prefix), so the same "chicken" in two files is one node and the files link up
+    //   - type:      "<x>_type" / "type" / "kind" / "class" -> that row's node label
+    //   - HIERARCHY: "parent", "broader", "is_a", "subclass_of", "super*" -> (row)-[:IS_A]->(value)
+    //   - NUMBER:    every value numeric -> typed property (so price comparisons work in Cypher)
+    //   - LIST:      ';' or '|' separated values -> (row)-[:INCLUDES_<COLUMN>]->(each value)
+    //   - CATEGORY:  short, repeating values -> (row)-[:OF_<COLUMN>]->(value) on a shared node
+    //   - REFERENCE: any other text column where at least half the distinct values are keys of some
+    //                table (or nodes already in this knowledge base) -> (row)-[:OF_<COLUMN>]->(value)
+    //   - otherwise a string property.
+    // Relationship types deliberately never start with HAS_: chat retrieval treats HAS_* as
+    // structural scaffolding (sections, chunks) and never walks past it, which would hide every
+    // CSV fact beyond the first hop.
+    //
+    // Once all rows are written, inferHierarchyRelationships() combines what the files share --
+    // see there.
+
+    private enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
+
+    private record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
+                                   Map<String, CsvColumnRole> roles) {}
+
+    private record CsvEdge(String from, String type, String to) {}
+
+    private static final Pattern CSV_HIERARCHY_COLUMN = Pattern.compile(
+            "(?i)^(parent([_ ]?(name|id))?|broader|is[_ ]?a|subclass[_ ]?of|super([_ ]?(class|type|category))?)$");
+    private static final Pattern CSV_TYPE_COLUMN      = Pattern.compile("(?i)^(.+[_ ])?(type|kind|class)$");
+    private static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
+    private static final int     MAX_HIERARCHY_DEPTH  = 8;
+
+    private Map<String, Object> importCsvInferred(String label, List<CsvTable> tables,
+                                                  List<String> warnings) throws Exception {
+        String safeLabel = sanitizeNeo4jName(label);
+
+        // Lower-cased name -> stored name / node type. Seeded with nodes already in this knowledge
+        // base so a CSV uploaded later (or a text-built graph) links to them instead of duplicating.
+        Map<String, String> canonical = new HashMap<>();
+        Map<String, String> nodeTypes = new HashMap<>();
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (n:KGNode {sourceLabel: $l}) WHERE NOT n:Section AND NOT n:Chunk " +
+                            "RETURN n.name AS name, labels(n) AS labels",
+                    Map.of("l", label)
+            ).forEachRemaining(r -> {
+                String name = r.get("name").asString();
+                String type = r.get("labels").asList(Value::asString).stream()
+                        .filter(l -> !l.equals("KGNode") && !l.equals(safeLabel))
+                        .findFirst().orElse("Entity");
+                canonical.put(csvKey(name), name);
+                nodeTypes.put(csvKey(name), type);
+            });
+        }
+
+        // 1. Profile every table and register its row keys before writing anything, so a column
+        //    can be recognised as a reference to another file's keys regardless of upload order.
+        List<CsvTableProfile> profiles = tables.stream().map(KnowledgeService::profileCsvTable).toList();
+        for (CsvTableProfile p : profiles) {
+            for (Map<String, String> row : p.table().rows()) {
+                String key = row.get(p.keyCol());
+                if (key == null || key.isBlank()) continue;
+                canonical.putIfAbsent(csvKey(key), key.trim());
+                nodeTypes.put(csvKey(key), rowType(p, row));
+            }
+        }
+        for (CsvTableProfile p : profiles) {
+            // Only free-text columns can turn into references -- a CATEGORY column already links to
+            // shared nodes, and re-checking it would flip its role on a re-import (its own values
+            // exist as nodes by then).
+            p.roles().replaceAll((col, role) -> {
+                if (role != CsvColumnRole.PROPERTY) return role;
+                Set<String> distinct = distinctValues(p.table(), col);
+                long known = distinct.stream().filter(v -> nodeTypes.containsKey(csvKey(v))).count();
+                return !distinct.isEmpty() && known * 2 >= distinct.size() ? CsvColumnRole.REFERENCE : role;
+            });
+        }
+
+        // 2. Build the node/edge set in memory (merging everything that shares a name), then write.
+        Map<String, Map<String, Object>> nodeProps  = new LinkedHashMap<>();
+        Map<String, Set<String>>         nodeTables = new LinkedHashMap<>();
+        Set<CsvEdge> edges = new LinkedHashSet<>();
+        List<String> embedNames = new ArrayList<>(), embedIds = new ArrayList<>(), embedTexts = new ArrayList<>();
+        Map<String, Map<String, String>> columnRoles = new LinkedHashMap<>();
+        int rowNodes = 0;
+
+        for (CsvTableProfile p : profiles) {
+            CsvTable table = p.table();
+            String tableLabel = sanitizeNeo4jName(table.name());
+            Map<String, String> rolesOut = new LinkedHashMap<>();
+            rolesOut.put(p.keyCol(), "KEY");
+            if (p.typeCol() != null) rolesOut.put(p.typeCol(), "TYPE");
+            p.roles().forEach((c, r) -> rolesOut.put(c, r.name()));
+            columnRoles.put(table.name(), rolesOut);
+
+            Map<String, String> parentTypes = new HashMap<>();
+            p.roles().forEach((col, role) -> {
+                if (role == CsvColumnRole.HIERARCHY) parentTypes.put(col, dominantKnownType(table, col, nodeTypes));
+            });
+
+            for (Map<String, String> row : table.rows()) {
+                String keyValue = row.get(p.keyCol());
+                if (keyValue == null || keyValue.isBlank()) continue;
+                String rowKey = touchCsvNode(keyValue, rowType(p, row), table.name(),
+                        canonical, nodeTypes, nodeProps, nodeTables);
+                rowNodes++;
+
+                for (Map.Entry<String, CsvColumnRole> col : p.roles().entrySet()) {
+                    String raw = row.get(col.getKey());
+                    if (raw == null || raw.isBlank()) continue;
+                    String value = raw.trim();
+                    String column = col.getKey();
+                    switch (col.getValue()) {
+                        case NUMBER   -> nodeProps.get(rowKey).put(column, parseCsvNumber(value));
+                        case PROPERTY -> nodeProps.get(rowKey).put(column, value);
+                        case HIERARCHY -> edges.add(new CsvEdge(rowKey, "IS_A", touchCsvNode(value,
+                                parentTypes.get(column), table.name(), canonical, nodeTypes, nodeProps, nodeTables)));
+                        case LIST -> {
+                            String itemType = csvPascal(csvSingular(column));
+                            for (String item : CSV_LIST_SEPARATOR.split(value)) {
+                                if (item.isBlank()) continue;
+                                edges.add(new CsvEdge(rowKey, "INCLUDES_" + csvRelName(csvSingular(column)),
+                                        touchCsvNode(item, itemType, table.name(), canonical, nodeTypes, nodeProps, nodeTables)));
+                            }
+                        }
+                        case REFERENCE -> edges.add(new CsvEdge(rowKey, "OF_" + csvRelName(column), touchCsvNode(value,
+                                csvPascal(csvSingular(column)), table.name(), canonical, nodeTypes, nodeProps, nodeTables)));
+                        case CATEGORY -> edges.add(new CsvEdge(rowKey, "OF_" + csvRelName(column), touchCsvNode(value,
+                                csvPascal(column), table.name(), canonical, nodeTypes, nodeProps, nodeTables)));
+                    }
+                }
+
+                String nodeName = canonical.get(rowKey);
+                embedNames.add(nodeName);
+                embedIds.add(label + "_csv_" + Math.abs((table.name() + "|" + nodeName).hashCode()));
+                embedTexts.add(csvRowSentence(tableLabel, keyValue.trim(), row, table.headers(), List.of(p.keyCol())));
+            }
+        }
+        edges.removeIf(e -> e.from().equals(e.to()));
+
+        try (Session session = driver.session()) { // Neo4j
+            for (Map.Entry<String, Map<String, Object>> n : nodeProps.entrySet()) {
+                // MERGE on identity only, then add labels -- MERGE with the labels in the pattern
+                // would create a second node whenever an existing one carries a different label.
+                session.run(String.format(
+                        "MERGE (n:KGNode {name: $name, sourceLabel: $label}) " +
+                        "ON CREATE SET n.nodeType = 'csv_entity' " +
+                        "SET n:`%s`:`%s`, n += $props, " +
+                        "    n.csvTables = reduce(acc = coalesce(n.csvTables, []), t IN $tables | " +
+                        "                         CASE WHEN t IN acc THEN acc ELSE acc + t END)",
+                        safeLabel, nodeTypes.get(n.getKey())),
+                        Map.of("name", canonical.get(n.getKey()), "label", label,
+                               "props", n.getValue(), "tables", List.copyOf(nodeTables.get(n.getKey()))));
+            }
+            for (CsvEdge e : edges) {
+                session.run(String.format(
+                        "MATCH (a:KGNode {name: $from, sourceLabel: $label}) " +
+                        "MATCH (b:KGNode {name: $to,   sourceLabel: $label}) " +
+                        "MERGE (a)-[:`%s`]->(b)", e.type()),
+                        Map.of("from", canonical.get(e.from()), "to", canonical.get(e.to()), "label", label));
+            }
+        }
+
+        // 3. Cross-file reasoning over the whole knowledge base (this and earlier imports).
+        int inferred = inferHierarchyRelationships(label);
+        long sharedNodes;
+        try (Session session = driver.session()) { // Neo4j
+            sharedNodes = session.run(
+                    "MATCH (n:KGNode {sourceLabel: $l}) WHERE size(coalesce(n.csvTables, [])) > 1 RETURN count(n) AS c",
+                    Map.of("l", label)
+            ).single().get("c").asLong();
+        }
+
+        int embedded = embedCsvRows(label, embedNames, embedIds, embedTexts);
+
+        triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("label", label);
+        result.put("mode", "inferred");
+        result.put("tablesProcessed", tables.size());
+        result.put("entityRows", rowNodes);
+        result.put("joinRows", 0);
+        result.put("tagRows", 0);
+        result.put("lookupRows", 0);
+        result.put("nodesWritten", nodeProps.size());
+        result.put("relationshipsCreated", edges.size());
+        result.put("inferredRelationships", inferred);
+        result.put("sharedNodes", sharedNodes);
+        result.put("rowsEmbedded", embedded);
+        result.put("columnRoles", columnRoles);
+        result.put("warnings", warnings);
+        return result;
+    }
+
+    /**
+     * Facts about a node that sits inside an IS_A hierarchy also hold for each of its ancestors:
+     * "Pad Thai INCLUDES_INGREDIENT shrimp" + "shrimp IS_A shellfish IS_A seafood" =>
+     * "Pad Thai INCLUDES_INGREDIENT_CATEGORY shellfish" and "... seafood" (with `via` naming the
+     * ingredient that justifies it). This is what joins two files that only share nodes -- one
+     * file's rows point at the nodes, the other file arranges them into a hierarchy. Materialising
+     * the derived edges matters because chat retrieval only walks a few hops: without them,
+     * "which dishes contain seafood?" needs dish -> shrimp -> shellfish -> seafood and back.
+     * Runs over the whole knowledge base, so it also links CSVs imported in separate uploads.
+     */
+    private int inferHierarchyRelationships(String label) {
+        int total = 0;
+        try (Session session = driver.session()) { // Neo4j
+            List<String> relTypes = session.run(
+                    "MATCH (:KGNode {sourceLabel: $l})-[r]->(:KGNode {sourceLabel: $l})-[:IS_A]->(:KGNode {sourceLabel: $l}) " +
+                            "WHERE type(r) <> 'IS_A' AND NOT coalesce(r.inferred, false) " +
+                            "  AND NOT type(r) STARTS WITH 'HAS_' AND type(r) <> 'PARENT_OF' " +
+                            "RETURN DISTINCT type(r) AS t",
+                    Map.of("l", label)
+            ).list(r -> r.get("t").asString());
+
+            for (String relType : relTypes) {
+                total += session.run(String.format(
+                        "MATCH (a:KGNode {sourceLabel: $l})-[:`%1$s`]->(b:KGNode {sourceLabel: $l})" +
+                        "-[:IS_A*1..%2$d]->(c:KGNode {sourceLabel: $l}) " +
+                        "WHERE a <> c " +
+                        "WITH a, c, collect(DISTINCT b.name) AS via " +
+                        "MERGE (a)-[x:`%1$s_CATEGORY`]->(c) " +
+                        "SET x.inferred = true, x.via = via " +
+                        "RETURN count(x) AS n",
+                        relType, MAX_HIERARCHY_DEPTH),
+                        Map.of("l", label)
+                ).single().get("n").asInt();
+            }
+        }
+        return total;
+    }
+
+    private static CsvTableProfile profileCsvTable(CsvTable table) {
+        String keyCol = table.headers().get(0);
+        String typeCol = null;
+        Map<String, CsvColumnRole> roles = new LinkedHashMap<>();
+        int rows = table.rows().size();
+        for (String col : table.headers()) {
+            if (col.equals(keyCol)) continue;
+            List<String> values = table.rows().stream().map(r -> r.get(col))
+                    .filter(v -> v != null && !v.isBlank()).map(String::trim).toList();
+            Set<String> distinct = new HashSet<>(values);
+            if (values.isEmpty()) {
+                roles.put(col, CsvColumnRole.PROPERTY);
+            } else if (typeCol == null && CSV_TYPE_COLUMN.matcher(col).matches()
+                    && distinct.size() <= Math.max(3, rows / 2)) {
+                typeCol = col;
+            } else if (CSV_HIERARCHY_COLUMN.matcher(col).matches()) {
+                roles.put(col, CsvColumnRole.HIERARCHY);
+            } else if (values.stream().allMatch(KnowledgeService::isCsvNumber)) {
+                roles.put(col, CsvColumnRole.NUMBER);
+            } else if (values.stream().anyMatch(v -> CSV_LIST_SEPARATOR.matcher(v).find())) {
+                roles.put(col, CsvColumnRole.LIST);
+            } else if (distinct.size() < values.size()
+                    && distinct.size() <= Math.max(3, values.size() * 0.6)
+                    && values.stream().allMatch(v -> v.length() <= 40)) {
+                roles.put(col, CsvColumnRole.CATEGORY);
+            } else {
+                roles.put(col, CsvColumnRole.PROPERTY);
+            }
+        }
+        return new CsvTableProfile(table, keyCol, typeCol, csvPascal(csvSingular(keyCol)), roles);
+    }
+
+    private static String rowType(CsvTableProfile p, Map<String, String> row) {
+        String t = p.typeCol() != null ? row.get(p.typeCol()) : null;
+        return t != null && !t.isBlank() ? csvPascal(t) : p.defaultType();
+    }
+
+    /** Registers a node touched by this import and returns its lower-cased identity key. */
+    private static String touchCsvNode(String rawName, String fallbackType, String tableName,
+                                       Map<String, String> canonical, Map<String, String> nodeTypes,
+                                       Map<String, Map<String, Object>> nodeProps,
+                                       Map<String, Set<String>> nodeTables) {
+        String key = csvKey(rawName);
+        canonical.putIfAbsent(key, rawName.trim());
+        nodeTypes.putIfAbsent(key, fallbackType);
+        nodeProps.computeIfAbsent(key, k -> new LinkedHashMap<>());
+        nodeTables.computeIfAbsent(key, k -> new LinkedHashSet<>()).add(tableName);
+        return key;
+    }
+
+    /** Label for hierarchy parents that never appear as rows ("animal product"): the most common label among those that do. */
+    private static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
+        return distinctValues(table, col).stream()
+                .map(v -> nodeTypes.get(csvKey(v)))
+                .filter(Objects::nonNull)
+                .collect(Collectors.groupingBy(t -> t, Collectors.counting()))
+                .entrySet().stream().max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey).orElse("Category");
+    }
+
+    private static Set<String> distinctValues(CsvTable table, String col) {
+        return table.rows().stream().map(r -> r.get(col))
+                .filter(v -> v != null && !v.isBlank()).map(String::trim)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private static String csvKey(String name) {
+        return name.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean isCsvNumber(String v) {
+        return v.matches("-?\\d+(\\.\\d+)?");
+    }
+
+    private static Object parseCsvNumber(String v) {
+        return v.contains(".") ? (Object) Double.parseDouble(v) : (Object) Long.parseLong(v);
+    }
+
+    private static String csvSingular(String word) {
+        String w = word.trim(), l = w.toLowerCase(Locale.ROOT);
+        if (l.endsWith("ies") && w.length() > 3) return w.substring(0, w.length() - 3) + "y";
+        if (l.matches(".*(ss|sh|ch|x|z)es$")) return w.substring(0, w.length() - 2);
+        if (l.endsWith("s") && !l.endsWith("ss")) return w.substring(0, w.length() - 1);
+        return w;
+    }
+
+    private static String csvPascal(String s) {
+        String out = Arrays.stream(s.trim().split("[^A-Za-z0-9]+"))
+                .filter(p -> !p.isEmpty())
+                .map(p -> Character.toUpperCase(p.charAt(0)) + p.substring(1))
+                .collect(Collectors.joining());
+        return out.isEmpty() ? "Entity" : out;
+    }
+
+    private static String csvRelName(String column) {
+        String rel = column.trim().replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "").toUpperCase(Locale.ROOT);
+        rel = rel.replaceFirst("^HAS_", "");
+        return rel.isEmpty() ? "RELATED_TO" : rel;
+    }
 
     private void mergeCsvNode(Session session, String label, String nodeLabel, String name,
                                Map<String, Object> props) {
@@ -1700,14 +2059,26 @@ public class KnowledgeService {
                     if (text != null && !text.isEmpty())
                         context.add(Map.of("passage", text, "source", match.getName()));
                     // Traverse chunk → section → entity to get a graph expansion seed
-                    runTraced(session, "resolve parent entity for chunk \"" + match.getName() + "\"",
+                    List<Record> parents = runTraced(session, "resolve parent entity for chunk \"" + match.getName() + "\"",
                             "MATCH (c:KGNode {name: $name, sourceLabel: $label})" +
                             "<-[:HAS_CHUNK]-(s:KGNode)<-[r]-(e:KGNode {sourceLabel: $label}) " +
                             "WHERE NOT e.nodeType IN ['section','chunk'] " +
                             "RETURN e.name AS entityName LIMIT 1",
                             Map.of("name", match.getName(), "label", label),
                             cypherTrace
-                    ).forEach(r -> {
+                    );
+                    // CSV row passages have no chunk/section scaffolding -- the passage is named
+                    // after its own row node, which is the seed itself.
+                    if (parents.isEmpty()) {
+                        parents = runTraced(session, "resolve row node for passage \"" + match.getName() + "\"",
+                                "MATCH (e:KGNode {name: $name, sourceLabel: $label}) " +
+                                "WHERE NOT coalesce(e.nodeType, '') IN ['section','chunk'] " +
+                                "RETURN e.name AS entityName LIMIT 1",
+                                Map.of("name", match.getName(), "label", label),
+                                cypherTrace
+                        );
+                    }
+                    parents.forEach(r -> {
                         String en = r.get("entityName").asString("");
                         if (!en.isEmpty()) seedEntityNames.add(en);
                     });
