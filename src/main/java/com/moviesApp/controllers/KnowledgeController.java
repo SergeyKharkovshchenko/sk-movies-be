@@ -143,7 +143,9 @@ public class KnowledgeController {
      * by column-naming convention (see KnowledgeService#importCsv), plus a flattened-sentence
      * embedding per entity row. Idempotent (MERGE-based) -- can be re-run or combined with a
      * text-derived KB under the same label.
-     * Body: { "label": "insurance-claims", "files": [{ "name": "Claim.csv", "content": "..." }] }
+     * Body: { "label": "insurance-claims", "files": [{ "name": "Claim.csv", "content": "..." }],
+     *        "deepAnalysis": true }  -- deepAnalysis (optional) adds an LLM taxonomy-enrichment pass
+     *        for CSVs without "*_Identifier" columns.
      */
     @PostMapping("/knowledge/import-csv")
     public ResponseEntity<Map<String, Object>> importCsv(@RequestBody Map<String, Object> body) {
@@ -154,8 +156,9 @@ public class KnowledgeController {
         if (files.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "files is required"));
         }
+        boolean deepAnalysis = Boolean.TRUE.equals(body.get("deepAnalysis"));
         try {
-            return ResponseEntity.ok(knowledgeService.importCsv(label, files));
+            return ResponseEntity.ok(knowledgeService.importCsv(label, files, deepAnalysis));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
