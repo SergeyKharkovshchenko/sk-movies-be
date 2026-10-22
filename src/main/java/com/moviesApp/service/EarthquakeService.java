@@ -18,8 +18,9 @@ import java.util.Map;
 @Service
 public class EarthquakeService {
 
-    // A year of daily points is still a light payload; anything wider is almost certainly a typo.
-    private static final long MAX_RANGE_DAYS = 366;
+    // Ten years of daily rows (~3.7k) is still a light payload, and the marts already hold more
+    // than one year -- a one-year cap made the FE's "All" preset fail. Wider is almost certainly a typo.
+    private static final long MAX_RANGE_DAYS = 3660;
 
     private final JdbcTemplate jdbc;
 
