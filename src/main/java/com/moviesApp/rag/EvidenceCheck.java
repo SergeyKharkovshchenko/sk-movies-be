@@ -38,26 +38,44 @@ public final class EvidenceCheck {
         return mentions(normalize(sourceText), name);
     }
 
+    /**
+     * Position of the entity's mention inside the (normalized) evidence sentence, or -1 -- lets a
+     * caller read off which entity comes first, e.g. to orient "X is a Y" as child X, parent Y.
+     */
+    public static int mentionIndex(String evidence, String name) {
+        return mentionAt(normalize(evidence), name);
+    }
+
+    /** The normalized form every check matches against -- positions from mentionIndex refer to it. */
+    public static String normalized(String s) {
+        return normalize(s);
+    }
+
     // Full name (optionally without a leading article), or -- for multi-word names -- its last
     // word when that's distinctive enough ("Nolan directed ..." for "Christopher Nolan").
     private static boolean mentions(String normalizedText, String name) {
-        if (name == null || name.isBlank()) return false;
+        return mentionAt(normalizedText, name) >= 0;
+    }
+
+    private static int mentionAt(String normalizedText, String name) {
+        if (name == null || name.isBlank()) return -1;
         String n = normalize(name);
-        if (containsPhrase(normalizedText, n)) return true;
+        int i = phraseIndex(normalizedText, n);
+        if (i >= 0) return i;
         String noArticle = LEADING_ARTICLE.matcher(n).replaceFirst("");
-        if (!noArticle.equals(n) && containsPhrase(normalizedText, noArticle)) return true;
+        if (!noArticle.equals(n) && (i = phraseIndex(normalizedText, noArticle)) >= 0) return i;
         String[] words = noArticle.split(" ");
         if (words.length >= 2) {
             String last = words[words.length - 1];
-            return last.length() >= 4 && containsPhrase(normalizedText, last);
+            if (last.length() >= 4) return phraseIndex(normalizedText, last);
         }
-        return false;
+        return -1;
     }
 
-    private static boolean containsPhrase(String text, String phrase) {
-        if (phrase.isEmpty()) return false;
-        return Pattern.compile("(?<![\\p{L}\\p{N}])" + Pattern.quote(phrase) + "(?![\\p{L}\\p{N}])")
-                .matcher(text).find();
+    private static int phraseIndex(String text, String phrase) {
+        if (phrase.isEmpty()) return -1;
+        var m = Pattern.compile("(?<![\\p{L}\\p{N}])" + Pattern.quote(phrase) + "(?![\\p{L}\\p{N}])").matcher(text);
+        return m.find() ? m.start() : -1;
     }
 
     private static String stripEndPunctuation(String s) {

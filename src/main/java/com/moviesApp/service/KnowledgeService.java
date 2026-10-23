@@ -287,46 +287,94 @@ public class KnowledgeService {
     // ── Taxonomy (deep analysis, opt-in) ────────────────────────────────────────
 
     private static final String TAXONOMY_PROMPT = """
-            You are a taxonomy analyst. Given a list of entity names extracted from a knowledge
-            graph, identify every PARENT-CHILD (hierarchical, taxonomic) relationship among them —
-            broader/narrower category, whole/part, type/instance, or "is a kind of" structure.
+            You are a taxonomy analyst. You get the SOURCE TEXT of a knowledge graph and the list of
+            entity names extracted from it. Identify the PARENT-CHILD (hierarchical, taxonomic)
+            relationships among those entities that the text itself states -- broader/narrower
+            category, type/instance, whole/part, or "is a kind of" structure.
 
-            Try hard: consider every pair, not just the obviously named ones. A hierarchy can be
-            implicit — e.g. a specific named battle is a child of a broader campaign or war, a city
-            is a child of the country/region it's in, a specific model is a child of its product
-            line, an individual is a child of a group/organization they belong to, a sub-topic is a
-            child of its parent topic.
+            CLOSED WORLD -- the text is the only source of truth:
+            - Use ONLY hierarchy the text states. Never add anything from your own knowledge, even if
+              it is true in the real world (e.g. a film's genre, a city's country, a person's group).
+            - Do not infer or guess structure from names or domain. If no sentence of the text states
+              that X is a kind / type / instance / part / member of Y, there is no pair.
+            - A hierarchy is NOT any other relationship: "X directed Y", "X acted in Y", "X was released
+              in 2010", "X lives in Y" are relationships, never parent-child pairs.
 
-            Return ONLY a valid JSON object — no markdown, no explanation. Group by parent so each
-            parent name is written once, not once per child -- this keeps the response compact when
-            a parent has many children (e.g. a product line with a dozen models):
+            Return ONLY a valid JSON object -- no markdown, no explanation:
             {
-              "taxonomy": {
-                "Broader Entity Name": ["Narrower Entity Name", "Another Narrower Entity Name"],
-                "Another Broader Entity Name": ["..."]
-              }
+              "taxonomy": [
+                {"parent": "Broader Entity", "child": "Narrower Entity",
+                 "evidence": "The exact sentence from the text stating the child is a kind/part of the parent."}
+              ]
             }
 
             Rules:
-            - Every key and every array entry MUST be an entity name taken verbatim from the
-              provided list — never invent a name that isn't in the list.
-            - Only include a pair when the hierarchical relationship is a reasonable, defensible
-              reading given the entity names and their apparent domain — do not force one that
-              isn't there.
-            - Each entity may appear as a child at most once across the whole object (pick the
-              most specific, immediate parent, not a distant ancestor) — do not create cycles.
-            - If no taxonomy exists among these entities at all, return {"taxonomy": {}}.
+            - "parent" and "child" MUST be entity names taken verbatim from the provided list. The
+              parent is the broader category or whole, the child the specific item or part: for
+              "Inception is a Science Fiction movie", parent = Science Fiction, child = Inception.
+            - "evidence" MUST be ONE sentence copied verbatim from the text that names both entities.
+              Pairs without such a sentence are discarded.
+            - Each entity may appear as a child at most once (its most specific, immediate parent);
+              no cycles.
+            - If the text states no hierarchy, return {"taxonomy": []}.
             """;
 
+    // A sentence only supports a parent-child pair if it states a hierarchy, not just any link
+    // between the two entities ("Inception is a Science Fiction movie" yes; "Tom Hardy acted in
+    // Dunkirk", "... was released in 2010" no). The cue also fixes the direction, which the LLM
+    // gets wrong often enough to matter: before a CHILD_FIRST cue stands the child ("Inception
+    // is a <genre>"), before a PARENT_FIRST cue the parent ("Drama includes Little Women").
+    private static final Pattern CHILD_FIRST_CUE = Pattern.compile(
+            "\\b(is|are|was|were)\\s+(a|an|one of|some|kind|kinds|type|types|sort|part|member|members|example|subtype|category|genre)\\b" +
+            "|\\b(kind|kinds|type|types|sort|sorts|class|subclass|category|categories|genre|part|member|members|subset|example|examples) of\\b" +
+            "|\\bbelongs? to\\b");
+    private static final Pattern PARENT_FIRST_CUE = Pattern.compile(
+            "\\b(consists? of|comprises?|includes?|including|contains?|such as)\\b");
+
+    /** Null when the proposed pair is backed by the text, otherwise why it isn't. */
+    private static String validateTaxonomyPair(String a, String b, String evidence, String sourceText,
+                                               Set<String> knownNames) {
+        if (a == null || b == null || !knownNames.contains(a) || !knownNames.contains(b)) return "unknown entity";
+        if (a.equals(b)) return "self-pair";
+        String reason = EvidenceCheck.reject(sourceText, evidence, a, b);
+        if (reason != null) return reason;
+        return orientByEvidence(evidence, a, b) == null ? "evidence states no hierarchy" : null;
+    }
+
     /**
-     * Opt-in extra pass: feeds every already-extracted entity name (excluding structural
-     * Section/Chunk nodes) to the LLM and asks specifically for parent-child structure, then
-     * stores each validated pair as a dedicated (parent)-[:PARENT_OF]->(child) edge — distinct
-     * from the general dynamic-predicate relationships the main extraction pass already writes.
-     * LLM output is validated against the known entity set before writing, so a hallucinated
-     * name never creates a stray node.
+     * {parent, child} as the evidence sentence states it, or null when the sentence states no
+     * hierarchy between the two (no cue, or both entities on the same side of it).
      */
-    public Map<String, Object> detectAndStoreTaxonomy(String label) throws Exception {
+    private static String[] orientByEvidence(String evidence, String a, String b) {
+        String ev = EvidenceCheck.normalized(evidence);
+        int ia = EvidenceCheck.mentionIndex(evidence, a), ib = EvidenceCheck.mentionIndex(evidence, b);
+        if (ia < 0 || ib < 0 || ia == ib) return null;
+        for (boolean childFirst : new boolean[]{true, false}) {
+            var m = (childFirst ? CHILD_FIRST_CUE : PARENT_FIRST_CUE).matcher(ev);
+            while (m.find()) {
+                int cue = m.start();
+                String before = ia < cue && ib > cue ? a : ib < cue && ia > cue ? b : null;
+                if (before == null) continue;
+                String after = before.equals(a) ? b : a;
+                return childFirst ? new String[]{after, before} : new String[]{before, after};
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Opt-in extra pass: asks the LLM for the parent-child structure the source text states among
+     * the already-extracted entity names (excluding structural Section/Chunk nodes), then stores
+     * each validated pair as a dedicated (parent)-[:PARENT_OF]->(child) edge -- distinct from the
+     * general dynamic-predicate relationships the main extraction pass already writes.
+     *
+     * Closed world, like extraction: each pair must quote one sentence of the source text that
+     * names both entities AND states a hierarchy (CHILD_FIRST_CUE / PARENT_FIRST_CUE, which also set the
+     * direction); unknown names, missing or
+     * non-taxonomic evidence, self-pairs, a second parent for the same child and cycles are all
+     * dropped before anything is written.
+     */
+    public Map<String, Object> detectAndStoreTaxonomy(String label, String sourceText) throws Exception {
         List<String> entityNames;
         try (Session session = driver.session()) { // Neo4j
             entityNames = session.run(
@@ -336,51 +384,59 @@ public class KnowledgeService {
             ).list(r -> r.get("name").asString());
         }
 
-        if (entityNames.size() < 2) {
-            return Map.of("count", 0, "pairs", List.of());
+        if (entityNames.size() < 2 || sourceText == null || sourceText.isBlank()) {
+            return Map.of("count", 0, "pairs", List.of(), "dropped", List.of());
         }
 
-        // At 4000 tokens the taxonomy JSON legitimately ran past the budget and got cut off
-        // mid-string on a 50+ entity graph, failing to parse entirely rather than gracefully
-        // returning a partial result. Raising the budget alone doesn't fully fix it either --
-        // gpt-4o-mini's own output ceiling is ~16384 tokens, so a flat list of {parent, child}
-        // pairs (repeating the parent name once per child) can still overflow it on a
-        // one-parent-many-children hierarchy. Grouping children under one parent-name-per-key
-        // (see TAXONOMY_PROMPT) cuts that repetition instead of just asking for more room.
-        String entityListText = entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
-        String response = openAi.chatDesign(TAXONOMY_PROMPT, entityListText, 16000).strip();
+        String input = "SOURCE TEXT:\n" + sourceText + "\n\nENTITY NAMES:\n" +
+                entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
+        String response = openAi.chatDesign(TAXONOMY_PROMPT, input, 16000).strip();
         if (response.startsWith("```")) {
             response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
 
         @SuppressWarnings("unchecked")
         Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
-        @SuppressWarnings("unchecked")
-        Map<String, List<String>> taxonomy = (Map<String, List<String>>) parsed.getOrDefault("taxonomy", Map.of());
+        List<Map<String, Object>> proposals = asListOfMaps(parsed.get("taxonomy"));
 
         Set<String> knownNames = new HashSet<>(entityNames);
+        Map<String, String> parentOf = new HashMap<>();
         List<Map<String, String>> validPairs = new ArrayList<>();
+        List<String> dropped = new ArrayList<>();
+        for (Map<String, Object> p : proposals) {
+            String parent = p.get("parent") instanceof String s ? s.strip() : null;
+            String child = p.get("child") instanceof String s ? s.strip() : null;
+            String evidence = p.get("evidence") instanceof String s ? s : null;
+            String reason = validateTaxonomyPair(parent, child, evidence, sourceText, knownNames);
+            if (reason == null) {
+                // Direction comes from the sentence, not from which field the LLM put a name in.
+                String[] oriented = orientByEvidence(evidence, parent, child);
+                parent = oriented[0];
+                child = oriented[1];
+                if (parentOf.containsKey(child)) reason = "child already has a parent";
+                else if (isAncestor(child, parent, parentOf)) reason = "would create a cycle";
+            }
+            if (reason != null) {
+                dropped.add(parent + " > " + child + " (" + reason + ")");
+                continue;
+            }
+            parentOf.put(child, parent);
+            validPairs.add(Map.of("parent", parent, "child", child));
+        }
+        if (!dropped.isEmpty()) log.info("[taxonomy] closed world: dropped {} pair(s): {}", dropped.size(), dropped);
+
         try (Session session = driver.session()) { // Neo4j
-            for (Map.Entry<String, List<String>> entry : taxonomy.entrySet()) {
-                String parent = entry.getKey();
-                if (parent == null || !knownNames.contains(parent)) continue; // drop hallucinated names
-                List<String> children = entry.getValue();
-                if (children == null) continue;
-                for (String child : children) {
-                    if (child == null || !knownNames.contains(child)) continue;
-                    if (parent.equals(child)) continue;
-                    session.run(
-                            "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                                    "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                                    "MERGE (p)-[:PARENT_OF]->(c)",
-                            Map.of("parent", parent, "child", child, "label", label)
-                    );
-                    validPairs.add(Map.of("parent", parent, "child", child));
-                }
+            for (Map<String, String> pair : validPairs) {
+                session.run(
+                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                "MERGE (p)-[:PARENT_OF]->(c)",
+                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
+                );
             }
         }
 
-        return Map.of("count", validPairs.size(), "pairs", validPairs);
+        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
     }
 
     /**
@@ -605,7 +661,13 @@ public class KnowledgeService {
                 if (deepAnalysis) {
                     send(emitter, "taxonomy_start", Map.of());
                     try {
-                        Map<String, Object> taxonomyResult = detectAndStoreTaxonomy(label);
+                        // The sections are the source text (step 2 copies every sentence verbatim),
+                        // so the taxonomy pass can be held to what they state.
+                        String sourceText = sections.stream()
+                                .map(s -> s.getOrDefault("text", ""))
+                                .filter(t -> t != null && !t.isBlank())
+                                .collect(Collectors.joining("\n"));
+                        Map<String, Object> taxonomyResult = detectAndStoreTaxonomy(label, sourceText);
                         send(emitter, "taxonomy_stored", taxonomyResult);
                     } catch (Exception e) {
                         // Non-fatal -- the main graph is already built; taxonomy is a bonus step.
