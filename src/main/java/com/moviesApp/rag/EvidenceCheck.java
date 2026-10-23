@@ -86,7 +86,11 @@ public final class EvidenceCheck {
         String noArticle = LEADING_ARTICLE.matcher(n).replaceFirst("");
         if (!noArticle.equals(n) && (i = phraseIndex(normalizedText, noArticle)) >= 0) return i;
         String[] words = noArticle.split(" ");
-        if (words.length >= 2) {
+        // Last-word fallback is for people ("Nolan" for "Christopher Nolan"). Names that start with
+        // an article are titles, and titles share last words ("The Broken Ledger" / "The Amber
+        // Ledger") -- matching on the last word would accept a sentence about the other movie.
+        boolean title = !noArticle.equals(n);
+        if (!title && words.length >= 2) {
             String last = words[words.length - 1];
             if (last.length() >= 4) return phraseIndex(normalizedText, last);
         }
