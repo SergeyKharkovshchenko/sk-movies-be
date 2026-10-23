@@ -33,6 +33,27 @@ public final class EvidenceCheck {
         return null;
     }
 
+    /** {@code kept}: the text with only sentences that occur in the source; {@code dropped}: the rest. */
+    public record Verbatim(String kept, java.util.List<String> dropped) {}
+
+    /**
+     * Keeps only the sentences of an LLM-produced "verbatim copy" (a section's text) that really
+     * occur in the source. Sections become the chunks that extraction is checked against, so an
+     * invented sentence slipping in here would let invented facts pass every later check.
+     */
+    public static Verbatim keepVerbatim(String sourceText, String text) {
+        java.util.List<String> kept = new java.util.ArrayList<>(), dropped = new java.util.ArrayList<>();
+        if (text == null) return new Verbatim("", dropped);
+        String source = normalize(sourceText);
+        for (String sentence : text.strip().split("(?<=[.!?])\\s+")) {
+            String s = sentence.strip();
+            if (s.isEmpty()) continue;
+            String n = stripEndPunctuation(normalize(s));
+            if (n.isEmpty() || source.contains(n)) kept.add(s); else dropped.add(s);
+        }
+        return new Verbatim(String.join(" ", kept), dropped);
+    }
+
     /** True when the entity name occurs in the source text (closed world for entities, too). */
     public static boolean occursIn(String sourceText, String name) {
         return mentions(normalize(sourceText), name);

@@ -91,7 +91,7 @@ public class KnowledgeController {
         try {
             String key = text.trim();
             var cache = cacheManager.getCache("suggestSections");
-            boolean wasCached = cache != null && cache.get(key) != null;
+            boolean wasCached = cache != null && cache.get(KnowledgeService.suggestSectionsCacheKey(key)) != null;
             List<?> sections = knowledgeService.suggestSections(key);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("sections", sections);
@@ -143,9 +143,8 @@ public class KnowledgeController {
      * by column-naming convention (see KnowledgeService#importCsv), plus a flattened-sentence
      * embedding per entity row. Idempotent (MERGE-based) -- can be re-run or combined with a
      * text-derived KB under the same label.
-     * Body: { "label": "insurance-claims", "files": [{ "name": "Claim.csv", "content": "..." }],
-     *        "deepAnalysis": true }  -- deepAnalysis (optional) adds an LLM taxonomy-enrichment pass
-     *        for CSVs without "*_Identifier" columns.
+     * Body: { "label": "insurance-claims", "files": [{ "name": "Claim.csv", "content": "..." }] }
+     * (A "deepAnalysis" field is ignored: CSV imports never add model knowledge.)
      */
     @PostMapping("/knowledge/import-csv")
     public ResponseEntity<Map<String, Object>> importCsv(@RequestBody Map<String, Object> body) {
@@ -156,9 +155,8 @@ public class KnowledgeController {
         if (files.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "files is required"));
         }
-        boolean deepAnalysis = Boolean.TRUE.equals(body.get("deepAnalysis"));
         try {
-            return ResponseEntity.ok(knowledgeService.importCsv(label, files, deepAnalysis));
+            return ResponseEntity.ok(knowledgeService.importCsv(label, files));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));

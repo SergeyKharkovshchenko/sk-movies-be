@@ -94,7 +94,13 @@ public class KnowledgeService {
             - No markdown, no explanation — just the JSON array
             """;
 
-    @Cacheable("suggestSections")
+    // Versioned like suggestGraphCacheKey: cached splits from before the verbatim check may hold
+    // sentences that aren't in the text.
+    public static String suggestSectionsCacheKey(String text) {
+        return "verbatim-v1:" + text;
+    }
+
+    @Cacheable(value = "suggestSections", key = "T(com.moviesApp.service.KnowledgeService).suggestSectionsCacheKey(#text)")
     public List<Map<String, String>> suggestSections(String text) throws Exception {
         String response = openAi.chatExtract(SECTION_SYSTEM_PROMPT, text, 16000).strip();
         if (response.startsWith("```")) {
@@ -103,10 +109,18 @@ public class KnowledgeService {
         @SuppressWarnings("unchecked")
         List<Map<String, String>> sections = objectMapper.readValue(response,
                 objectMapper.getTypeFactory().constructCollectionType(List.class, Map.class));
-        return sections.stream()
-                .filter(s -> s.containsKey("title") && s.containsKey("text")
-                        && !s.get("text").isBlank())
-                .toList();
+        // Zero model knowledge: a section may only contain sentences of the source text.
+        List<Map<String, String>> verified = new ArrayList<>();
+        for (Map<String, String> s : sections) {
+            if (!s.containsKey("title") || s.get("text") == null) continue;
+            EvidenceCheck.Verbatim v = EvidenceCheck.keepVerbatim(text, s.get("text"));
+            if (!v.dropped().isEmpty()) log.info("[suggest-sections] dropped non-source sentences: {}", v.dropped());
+            if (v.kept().isBlank()) continue;
+            Map<String, String> copy = new LinkedHashMap<>(s);
+            copy.put("text", v.kept());
+            verified.add(copy);
+        }
+        return verified;
     }
 
     // ── Suggest graph ─────────────────────────────────────────────────────────
@@ -216,7 +230,7 @@ public class KnowledgeService {
     // cached answer from before the closed-world rules may hold invented relationships, and must
     // not be served for the same text again.
     public static String suggestGraphCacheKey(String text) {
-        return "closed-world-v1:" + text;
+        return "closed-world-v2:" + text; // v2: sections are verified verbatim too
     }
 
     @Cacheable(value = "suggestGraph", key = "T(com.moviesApp.service.KnowledgeService).suggestGraphCacheKey(#text)")
@@ -259,6 +273,24 @@ public class KnowledgeService {
             result.put("entities", kept);
         }
 
+        // Sections are the chunks extraction runs on and checks evidence against -- they may only
+        // hold sentences of the source text, or an invented sentence would launder invented facts.
+        List<String> droppedSentences = new ArrayList<>();
+        if (result.get("sections") instanceof List<?> sections) {
+            List<Object> kept = new ArrayList<>();
+            for (Object s : sections) {
+                if (!(s instanceof Map<?, ?> m)) continue;
+                EvidenceCheck.Verbatim v = EvidenceCheck.keepVerbatim(text, String.valueOf(m.get("text")));
+                droppedSentences.addAll(v.dropped());
+                if (v.kept().isBlank()) continue;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> copy = new LinkedHashMap<>((Map<String, Object>) m);
+                copy.put("text", v.kept());
+                kept.add(copy);
+            }
+            result.put("sections", kept);
+        }
+
         List<String> droppedRelationships = new ArrayList<>();
         if (result.get("entityRelationships") instanceof List<?> rels) {
             List<Object> kept = new ArrayList<>();
@@ -276,12 +308,13 @@ public class KnowledgeService {
             result.put("entityRelationships", kept);
         }
 
-        if (!droppedEntities.isEmpty() || !droppedRelationships.isEmpty()) {
-            log.info("[suggest-graph] closed world: dropped entities {} and relationships {}",
-                    droppedEntities, droppedRelationships);
+        if (!droppedEntities.isEmpty() || !droppedRelationships.isEmpty() || !droppedSentences.isEmpty()) {
+            log.info("[suggest-graph] closed world: dropped entities {}, relationships {}, non-source sentences {}",
+                    droppedEntities, droppedRelationships, droppedSentences);
         }
         result.put("droppedEntities", droppedEntities);
         result.put("droppedRelationships", droppedRelationships);
+        result.put("droppedSentences", droppedSentences);
     }
 
     // ── Taxonomy (deep analysis, opt-in) ────────────────────────────────────────
@@ -729,8 +762,7 @@ public class KnowledgeService {
     // invisible to vector search and, if the repository query were also widened, would still only
     // render as a bare name rather than the full row sentence.
 
-    public Map<String, Object> importCsv(String label, List<Map<String, String>> files,
-                                         boolean deepAnalysis) throws Exception {
+    public Map<String, Object> importCsv(String label, List<Map<String, String>> files) throws Exception {
         List<String> warnings = new ArrayList<>();
         List<CsvTable> tables = new ArrayList<>();
         for (Map<String, String> file : files) {
@@ -756,7 +788,7 @@ public class KnowledgeService {
         boolean conventionBatch = tables.stream()
                 .anyMatch(t -> t.headers().stream().anyMatch(h -> h.endsWith("_Identifier")));
         if (!conventionBatch) {
-            return importCsvInferred(label, tables, warnings, deepAnalysis);
+            return importCsvInferred(label, tables, warnings);
         }
 
         int entityRows = 0, joinRows = 0, tagRows = 0, lookupRows = 0, relationshipsCreated = 0;
@@ -924,7 +956,7 @@ public class KnowledgeService {
     private static final Pattern CSV_PLACEHOLDER_NAME = Pattern.compile("(?i)null|none|n/?a|unknown|other|misc(ellaneous)?|-");
 
     private Map<String, Object> importCsvInferred(String label, List<CsvTable> tables,
-                                                  List<String> warnings, boolean deepAnalysis) throws Exception {
+                                                  List<String> warnings) throws Exception {
         String safeLabel = sanitizeNeo4jName(label);
 
         // Lower-cased name -> stored name / node type. Seeded with nodes already in this knowledge
@@ -975,7 +1007,6 @@ public class KnowledgeService {
         Set<CsvEdge> edges = new LinkedHashSet<>();
         List<String> embedNames = new ArrayList<>(), embedIds = new ArrayList<>(), embedTexts = new ArrayList<>();
         Map<String, Map<String, String>> columnRoles = new LinkedHashMap<>();
-        Set<String> listItemTypes = new LinkedHashSet<>();
         int rowNodes = 0;
 
         for (CsvTableProfile p : profiles) {
@@ -1016,7 +1047,6 @@ public class KnowledgeService {
                                 String itemKey = touchCsvNode(item, itemType, table.name(),
                                         canonical, nodeTypes, nodeProps, nodeTables);
                                 edges.add(new CsvEdge(rowKey, "INCLUDES_" + csvRelName(csvSingular(column)), itemKey));
-                                listItemTypes.add(nodeTypes.get(itemKey));
                             }
                         }
                         case REFERENCE -> edges.add(new CsvEdge(rowKey, "OF_" + csvRelName(column), touchCsvNode(value,
@@ -1057,19 +1087,9 @@ public class KnowledgeService {
             }
         }
 
-        // 3. Optional LLM pass that completes the hierarchy (places unclassified items, adds missing
-        //    broader levels) -- before the derived-edge pass, so its links feed straight into it.
-        Map<String, Object> taxonomy = null;
-        if (deepAnalysis) {
-            try {
-                taxonomy = enrichCsvTaxonomy(label, listItemTypes);
-            } catch (Exception e) {
-                // Non-fatal -- the CSV graph is already written; enrichment is a bonus step.
-                warnings.add("Taxonomy enrichment failed: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
-            }
-        }
-
-        // 4. Cross-file reasoning over the whole knowledge base (this and earlier imports).
+        // 3. Cross-file reasoning over the whole knowledge base (this and earlier imports). Purely
+        //    deterministic over the data -- there is deliberately no LLM step that "completes" the
+        //    hierarchy: the graph holds only what the CSV files contain (zero model knowledge).
         int inferred = inferHierarchyRelationships(label);
         long sharedNodes;
         try (Session session = driver.session()) { // Neo4j
@@ -1094,329 +1114,11 @@ public class KnowledgeService {
         result.put("nodesWritten", nodeProps.size());
         result.put("relationshipsCreated", edges.size());
         result.put("inferredRelationships", inferred);
-        if (taxonomy != null) result.put("taxonomy", taxonomy);
         result.put("sharedNodes", sharedNodes);
         result.put("rowsEmbedded", embedded);
         result.put("columnRoles", columnRoles);
         result.put("warnings", warnings);
         return result;
-    }
-
-    private static final String CSV_TAXONOMY_PLACE_PROMPT = """
-            You are a taxonomy designer completing a classification hierarchy for a knowledge graph.
-            You get the CURRENT HIERARCHY as an indented tree (broadest category first) and a list of
-            UNPLACED items that have no category yet.
-
-            Every link you add means "<child> is a kind of <parent>" and must be literally true.
-            Before writing a link, say that sentence to yourself; if it is false or only loosely
-            associated (an oil is not a nut, a wine is not a fruit, coffee is not a spice), choose
-            or create a better category instead, or leave the item out.
-
-            - Place each unplaced item under the most specific fitting category: an existing one,
-              or a new one. New categories may sit under an existing category or another new one.
-            - Add a missing intermediate level where it makes the tree clearer.
-            - Match the naming style of the existing categories (casing, singular nouns, language);
-              with no existing categories, use lowercase singular nouns ("vegetable", "dairy").
-
-            Return ONLY a valid JSON object -- no markdown, no explanation:
-            {
-              "newCategories": [{"name": "<new category>", "parent": "<existing or new category, or null>"}],
-              "placements":    {"<unplaced item>": "<existing or new category>"}
-            }
-
-            Rules:
-            - "placements" keys MUST be names from the UNPLACED list, verbatim.
-            - Never move anything that is already in the current hierarchy.
-            - Leave an item out rather than forcing it into a category that doesn't fit. No cycles.
-            """;
-
-    private static final String CSV_TAXONOMY_GROUP_PROMPT = """
-            You organise the TOP LEVEL of a classification hierarchy. You get the current top-level
-            categories, each with a few example members. Where several of them are genuinely kinds
-            of one broader thing, introduce that broader category and list them under it -- e.g.
-            "fruit", "vegetable" and "herb" are all kinds of "plant product". Aim for a small number
-            of meaningful top levels, but only group categories when "<category> is a kind of
-            <broader category>" is literally true for each of them; leave the rest ungrouped.
-
-            Return ONLY a valid JSON object -- no markdown, no explanation:
-            {"groups": {"<broader category>": ["<top-level category>", "<top-level category>"]}}
-
-            Rules:
-            - List entries MUST be top-level category names from the input, verbatim; each may
-              appear in at most one group.
-            - A broader category may be a new name or one of the given top-level categories.
-            - Every group needs at least two members. Match the existing naming style.
-            - Return {"groups": {}} if nothing should be grouped.
-            """;
-
-    private static final String CSV_TAXONOMY_REVIEW_PROMPT = """
-            You review proposed taxonomy links. Each numbered line is a claim
-            "<child> is a kind of <parent>". When the child is itself a category, its members are
-            listed in brackets.
-
-            A claim is valid only if the child is genuinely a kind, subtype or instance of the
-            parent -- being related to it, used with it or found in it is NOT enough. For a category
-            child, the claim is valid only if EVERY listed member is also a kind of the parent
-            (e.g. "spice [chili, star anise] is a kind of herb" is false; so is
-            "grain [rice noodles] is a kind of gluten").
-
-            Judge every claim independently. Return ONLY a valid JSON object -- no markdown, no
-            explanation -- with one verdict per claim number:
-            {"verdicts": {"1": true, "2": false}}
-            """;
-
-    /**
-     * Opt-in ("deep analysis") LLM pass that completes the CSV-built hierarchy so it reads broad ->
-     * specific instead of stopping at whatever the source files covered. Three focused calls --
-     * one job each works far better than one call doing everything:
-     *   1. place:  file every unclassified node of the hierarchy's item types (e.g. Ingredient)
-     *              under an existing or new category (with no hierarchy at all: the list-column
-     *              items, e.g. a dishes file alone, get a fresh one)
-     *   2. group:  give loose top-level categories broader parents ("fruit", "vegetable" ->
-     *              "plant product")
-     *   3. review: judge every proposed "child is a kind of parent" claim on its own and drop the
-     *              false ones -- the generating calls reliably slip in loose associations
-     * Everything is then validated like detectAndStoreTaxonomy: only known unplaced items and
-     * current top levels can be attached, nothing from the data is re-parented, an existing
-     * non-category node never becomes a category, cycles are rejected, and new categories left
-     * empty are dropped. LLM-made links are tagged {source: 'llm'}.
-     */
-    private Map<String, Object> enrichCsvTaxonomy(String label, Set<String> listItemTypes) throws Exception {
-        String safeLabel = sanitizeNeo4jName(label);
-        Map<String, String> parentOf = new LinkedHashMap<>(); // child -> parent (IS_A)
-        Map<String, String> typeOf   = new LinkedHashMap<>(); // every entity node -> its type label
-        try (Session session = driver.session()) { // Neo4j
-            session.run(
-                    "MATCH (c:KGNode {sourceLabel: $l})-[:IS_A]->(p:KGNode {sourceLabel: $l}) RETURN c.name AS c, p.name AS p",
-                    Map.of("l", label)
-            ).forEachRemaining(r -> parentOf.putIfAbsent(r.get("c").asString(), r.get("p").asString()));
-            session.run(
-                    "MATCH (n:KGNode {sourceLabel: $l}) WHERE NOT n:Section AND NOT n:Chunk " +
-                            "RETURN n.name AS name, labels(n) AS labels",
-                    Map.of("l", label)
-            ).forEachRemaining(r -> typeOf.put(r.get("name").asString(),
-                    r.get("labels").asList(Value::asString).stream()
-                            .filter(l -> !l.equals("KGNode") && !l.equals(safeLabel))
-                            .findFirst().orElse("Entity")));
-        }
-
-        Set<String> categories = new LinkedHashSet<>(parentOf.values());
-        Set<String> inHierarchy = new HashSet<>(parentOf.keySet());
-        inHierarchy.addAll(categories);
-        Set<String> itemTypes = parentOf.isEmpty()
-                ? listItemTypes
-                : parentOf.keySet().stream().map(typeOf::get).filter(Objects::nonNull).collect(Collectors.toSet());
-        List<String> unplaced = typeOf.entrySet().stream()
-                .filter(e -> itemTypes.contains(e.getValue()) && !inHierarchy.contains(e.getKey()))
-                .map(Map.Entry::getKey).sorted().toList();
-        List<String> roots = categories.stream().filter(c -> !parentOf.containsKey(c)).sorted().toList();
-        if (unplaced.isEmpty() && roots.size() < 2) {
-            return Map.of("placed", 0, "newCategories", List.of(), "groupedTopLevels", 0, "rejected", 0);
-        }
-
-        // Name resolution: existing categories first, then new ones. A name the LLM uses as a
-        // parent without declaring it ("beverage") still counts as a new category, but an existing
-        // non-category node (an ingredient) is never promoted to one.
-        Map<String, String> existing = new HashMap<>();
-        typeOf.keySet().forEach(n -> existing.put(csvKey(n), n));
-        Set<String> categoryKeys = categories.stream().map(KnowledgeService::csvKey).collect(Collectors.toSet());
-        Map<String, String> newCats = new LinkedHashMap<>(); // lower -> name
-        java.util.function.Function<Object, String> category = v -> {
-            // LLMs write "null"/"none" for "no category" as often as a real JSON null.
-            if (!(v instanceof String s) || s.isBlank() || CSV_PLACEHOLDER_NAME.matcher(s.trim()).matches()) return null;
-            String k = csvKey(s);
-            if (categoryKeys.contains(k)) return existing.get(k);
-            if (newCats.containsKey(k)) return newCats.get(k);
-            if (existing.containsKey(k)) return null;
-            newCats.put(k, s.trim());
-            return s.trim();
-        };
-
-        Set<String> unplacedSet = new HashSet<>(unplaced);
-        Map<String, String> proposed = new LinkedHashMap<>(); // child -> parent
-        int rejected = 0;
-
-        // 1-3. Place -> (group) -> review, plus one repair round in which items whose placement the
-        //      review rejected are placed again with that feedback (and reviewed again).
-        List<String> reviewRejected = new ArrayList<>();
-        List<String> reviewFailures = new ArrayList<>();
-        Set<String> topLevelSet = new HashSet<>();
-        List<String> remaining = unplaced;
-        List<String> feedback = new ArrayList<>();
-        for (int round = 0; round < 2; round++) {
-            Map<String, String> fresh = new LinkedHashMap<>(); // this round's proposals, child -> parent
-            Map<String, String> current = new LinkedHashMap<>(parentOf);
-            current.putAll(proposed);
-
-            // Place unclassified items.
-            if (!remaining.isEmpty()) {
-                StringBuilder prompt = new StringBuilder("CURRENT HIERARCHY:\n");
-                appendForest(prompt, current, rootsOf(current));
-                if (current.isEmpty()) prompt.append("(none yet)\n");
-                prompt.append("\nUNPLACED:\n");
-                remaining.forEach(n -> prompt.append("- ").append(n).append('\n'));
-                if (!feedback.isEmpty()) {
-                    prompt.append("\nREJECTED BY REVIEW -- these links are wrong, do not propose them again:\n");
-                    feedback.forEach(r -> prompt.append("- ").append(r).append('\n'));
-                }
-                Map<String, Object> placed = askJson(CSV_TAXONOMY_PLACE_PROMPT, prompt.toString(), 8000);
-                for (Map<String, Object> spec : asListOfMaps(placed.get("newCategories"))) {
-                    String name = category.apply(spec.get("name"));
-                    if (name == null) { rejected++; continue; }
-                    if (spec.get("parent") == null || !newCats.containsKey(csvKey(name)) || current.containsKey(name)) continue;
-                    String parent = category.apply(spec.get("parent"));
-                    if (parent != null) fresh.put(name, parent); else rejected++;
-                }
-                Set<String> remainingSet = new HashSet<>(remaining);
-                for (Map.Entry<String, Object> e : asMap(placed.get("placements")).entrySet()) {
-                    String child = existing.get(csvKey(e.getKey())), parent = category.apply(e.getValue());
-                    if (child != null && remainingSet.contains(child) && parent != null) fresh.put(child, parent); else rejected++;
-                }
-            }
-
-            // Group the top level (existing roots plus new categories without a parent) -- once.
-            if (round == 0) {
-                Map<String, String> withFresh = new LinkedHashMap<>(current);
-                withFresh.putAll(fresh);
-                Map<String, List<String>> members = membersOf(withFresh);
-                List<String> topLevels = new ArrayList<>(roots);
-                newCats.values().stream().filter(c -> !withFresh.containsKey(c)).forEach(topLevels::add);
-                topLevelSet.addAll(topLevels);
-                if (topLevels.size() >= 3) {
-                    StringBuilder prompt = new StringBuilder("TOP-LEVEL CATEGORIES:\n");
-                    for (String t : topLevels) {
-                        List<String> m = members.getOrDefault(t, List.of());
-                        prompt.append("- ").append(t).append(" (e.g. ")
-                                .append(String.join(", ", m.subList(0, Math.min(6, m.size())))).append(")\n");
-                    }
-                    Map<String, Object> grouped = askJson(CSV_TAXONOMY_GROUP_PROMPT, prompt.toString(), 4000);
-                    for (Map.Entry<String, Object> g : asMap(grouped.get("groups")).entrySet()) {
-                        if (!(g.getValue() instanceof List<?> list)) continue;
-                        String parent = category.apply(g.getKey());
-                        if (parent == null) { rejected++; continue; }
-                        List<String> valid = list.stream()
-                                .map(v -> v instanceof String s ? resolveName(s, existing, newCats) : null)
-                                .filter(c -> c != null && topLevelSet.contains(c) && !c.equals(parent) && !fresh.containsKey(c))
-                                .distinct().toList();
-                        if (valid.size() < 2) { rejected += valid.size(); continue; }
-                        valid.forEach(c -> fresh.put(c, parent));
-                    }
-                }
-            }
-            if (fresh.isEmpty()) break;
-
-            // Review this round's claims, each on its own, with member context for categories.
-            Map<String, String> context = new LinkedHashMap<>(current);
-            context.putAll(fresh);
-            Map<String, String> falseClaims = reviewTaxonomyClaims(fresh, membersOf(context), reviewFailures);
-            falseClaims.forEach((child, parent) -> {
-                fresh.remove(child);
-                reviewRejected.add(child + " -> " + parent);
-            });
-            proposed.putAll(fresh);
-
-            feedback = falseClaims.entrySet().stream()
-                    .map(e -> e.getKey() + " is NOT a kind of " + e.getValue()).toList();
-            remaining = falseClaims.keySet().stream().filter(unplacedSet::contains).sorted().toList();
-            if (remaining.isEmpty()) break;
-        }
-        rejected += reviewRejected.size();
-
-        // 4. Cycle guard, then drop new categories nothing ended up under (repeat: dropping one
-        //    can empty the new category above it).
-        Map<String, String> tree = new HashMap<>(parentOf);
-        Map<String, String> accepted = new LinkedHashMap<>();
-        for (Map.Entry<String, String> e : proposed.entrySet()) {
-            if (e.getKey().equals(e.getValue()) || isAncestor(e.getKey(), e.getValue(), tree)) { rejected++; continue; }
-            tree.put(e.getKey(), e.getValue());
-            accepted.put(e.getKey(), e.getValue());
-        }
-        boolean changed = true;
-        while (changed) {
-            changed = false;
-            for (String cat : List.copyOf(newCats.values())) {
-                if (accepted.containsValue(cat)) continue;
-                newCats.values().remove(cat);
-                if (accepted.remove(cat) != null) rejected++;
-                changed = true;
-            }
-        }
-
-        String categoryType = categories.stream().map(typeOf::get).filter(Objects::nonNull)
-                .collect(Collectors.groupingBy(t -> t, Collectors.counting()))
-                .entrySet().stream().max(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey).orElse("Category");
-        try (Session session = driver.session()) { // Neo4j
-            for (String cat : newCats.values()) {
-                session.run(String.format(
-                        "MERGE (n:KGNode {name: $name, sourceLabel: $label}) " +
-                        "ON CREATE SET n.nodeType = 'csv_entity', n.inferredBy = 'llm' " +
-                        "SET n:`%s`:`%s`", safeLabel, categoryType),
-                        Map.of("name", cat, "label", label));
-            }
-            for (Map.Entry<String, String> e : accepted.entrySet()) {
-                session.run(
-                        "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                        "MERGE (c)-[r:IS_A]->(p) ON CREATE SET r.source = 'llm'",
-                        Map.of("child", e.getKey(), "parent", e.getValue(), "label", label));
-            }
-        }
-
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("placed", accepted.keySet().stream().filter(unplacedSet::contains).count());
-        out.put("unplacedBefore", unplaced.size());
-        out.put("newCategories", List.copyOf(newCats.values()));
-        out.put("groupedTopLevels", accepted.keySet().stream().filter(topLevelSet::contains).count());
-        out.put("rejected", rejected);
-        out.put("rejectedByReview", reviewRejected);
-        if (!reviewFailures.isEmpty()) out.put("reviewFailed", reviewFailures);
-        return out;
-    }
-
-    private Map<String, Object> askJson(String systemPrompt, String userContent, int maxTokens) throws Exception {
-        String response = openAi.chatDesign(systemPrompt, userContent, maxTokens).strip();
-        if (response.startsWith("```")) {
-            response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
-        }
-        @SuppressWarnings("unchecked")
-        Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
-        return parsed;
-    }
-
-    /**
-     * Returns the claims (child -> parent) the reviewer judged false. Retries once on an unusable
-     * reply; if that fails too the claims are kept unreviewed and the failure is reported, rather
-     * than silently passing everything through.
-     */
-    private Map<String, String> reviewTaxonomyClaims(Map<String, String> claims, Map<String, List<String>> members,
-                                                     List<String> failures) {
-        List<Map.Entry<String, String>> list = new ArrayList<>(claims.entrySet());
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < list.size(); i++) {
-            String child = list.get(i).getKey();
-            List<String> m = members.getOrDefault(child, List.of());
-            sb.append(i + 1).append(". ").append(child);
-            if (!m.isEmpty()) sb.append(" [").append(String.join(", ", m.subList(0, Math.min(8, m.size())))).append(']');
-            sb.append(" is a kind of ").append(list.get(i).getValue()).append('\n');
-        }
-        for (int attempt = 1; attempt <= 2; attempt++) {
-            try {
-                Map<String, Object> verdicts = asMap(askJson(CSV_TAXONOMY_REVIEW_PROMPT, sb.toString(), 4000).get("verdicts"));
-                if (verdicts.isEmpty()) throw new IllegalStateException("no verdicts in review reply");
-                Map<String, String> falseClaims = new LinkedHashMap<>();
-                for (int i = 0; i < list.size(); i++) {
-                    if (Boolean.FALSE.equals(verdicts.get(String.valueOf(i + 1)))) {
-                        falseClaims.put(list.get(i).getKey(), list.get(i).getValue());
-                    }
-                }
-                return falseClaims;
-            } catch (Exception e) {
-                log.warn("[taxonomy] review attempt {} failed: {}", attempt, e.getMessage());
-                if (attempt == 2) failures.add(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
-            }
-        }
-        return Map.of();
     }
 
     private static Map<String, List<String>> membersOf(Map<String, String> parentOf) {
@@ -1428,27 +1130,6 @@ public class KnowledgeService {
 
     private static List<String> rootsOf(Map<String, String> parentOf) {
         return parentOf.values().stream().distinct().filter(p -> !parentOf.containsKey(p)).sorted().toList();
-    }
-
-    private static String resolveName(String raw, Map<String, String> existing, Map<String, String> newCats) {
-        String k = csvKey(raw);
-        return existing.containsKey(k) ? existing.get(k) : newCats.get(k);
-    }
-
-    private static void appendForest(StringBuilder sb, Map<String, String> parentOf, List<String> roots) {
-        Map<String, List<String>> childrenOf = new TreeMap<>();
-        parentOf.forEach((c, p) -> childrenOf.computeIfAbsent(p, k -> new ArrayList<>()).add(c));
-        for (String root : roots) appendTree(sb, root, childrenOf, 0, new HashSet<>());
-    }
-
-    private static void appendTree(StringBuilder sb, String node, Map<String, List<String>> childrenOf,
-                                   int depth, Set<String> path) {
-        if (!path.add(node)) return; // cycle in source data
-        sb.append("  ".repeat(depth)).append(node).append('\n');
-        for (String child : childrenOf.getOrDefault(node, List.of())) {
-            appendTree(sb, child, childrenOf, depth + 1, path);
-        }
-        path.remove(node);
     }
 
     private static boolean isAncestor(String candidate, String node, Map<String, String> parentOf) {
