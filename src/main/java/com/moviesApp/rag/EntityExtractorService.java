@@ -41,10 +41,10 @@ public class EntityExtractorService {
                  ENABLED, PREVENTED) only when the text states them outright
                - If no relationships exist, use an empty array: []
 
-            2. "descriptions": a map of entity name to a one-sentence description.
-               Include every entity that appears in the triples. Describe each entity ONLY with what
-               this text says about it -- no outside knowledge.
-               Format: {"EntityName": "One sentence describing the entity, based on the text only."}
+            2. "descriptions": a map of entity name to ONE sentence copied verbatim from the text that
+               names the entity and says the most about it. Never write a description yourself --
+               only quote. Include every entity that appears in the triples.
+               Format: {"EntityName": "The exact sentence from the text."}
 
             Return ONLY the JSON object -- no markdown, no explanation:
             {
@@ -80,7 +80,10 @@ public class EntityExtractorService {
                 "use this EXACT spelling (do not paraphrase, abbreviate, or expand):\n" +
                 String.join(", ", canonicalNames);
         try {
-            String response = openAi.chat(prompt, text).strip();
+            // Every triple and description carries a quoted sentence, so a dense 1500-char chunk
+            // easily needs more than the 2000-token default -- a cut-off reply is unparseable JSON
+            // and the whole chunk would yield nothing.
+            String response = openAi.chatExtract(prompt, text, 8000).strip();
             if (response.startsWith("```")) {
                 response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
             }
@@ -111,24 +114,30 @@ public class EntityExtractorService {
                     dropped.add(t.subject() + " -" + t.predicate() + "-> " + t.object() + " (" + reason + ")");
                 }
             }
-            if (!dropped.isEmpty()) log.info("[extract] dropped {} unsupported triple(s): {}", dropped.size(), dropped);
 
-            // Descriptions only for entities that survived -- a description of a dropped entity
-            // would bring its (outside-knowledge) facts back in through the chat context.
+            // Descriptions are quotes, not prose: kept only for entities that survived and only when
+            // the sentence is really in this chunk and names the entity. A model-written description
+            // is exactly where outside knowledge ("... known for The Dark Knight Rises") would slip
+            // back into the chat context.
             Set<String> kept = new LinkedHashSet<>();
             triples.forEach(t -> { kept.add(t.subject()); kept.add(t.object()); });
             Map<String, String> descriptions = new LinkedHashMap<>();
             if (raw.get("descriptions") instanceof Map<?, ?> d) {
                 d.forEach((k, v) -> {
                     if (k instanceof String name && v instanceof String desc && kept.contains(name)) {
-                        descriptions.put(name, desc);
+                        String reason = EvidenceCheck.reject(text, desc, name, name);
+                        if (reason == null) descriptions.put(name, desc.strip());
+                        else dropped.add("description of " + name + " (" + reason + ")");
                     }
                 });
             }
 
+            if (!dropped.isEmpty()) log.info("[extract] dropped {} unsupported item(s): {}", dropped.size(), dropped);
             return new ExtractionResult(triples, descriptions, dropped);
 
         } catch (Exception e) {
+            // Was silent: a chunk that failed looked exactly like a chunk with no facts in it.
+            log.warn("[extract] extraction failed for a {}-char chunk: {}", text.length(), e.getMessage());
             return ExtractionResult.empty();
         }
     }
