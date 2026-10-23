@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.moviesApp.entities.BikeEmbedding;
 import com.moviesApp.entities.Relation;
 import com.moviesApp.rag.EntityExtractorService;
+import com.moviesApp.rag.EvidenceCheck;
 import com.moviesApp.rag.EntityExtractorService.ExtractionResult;
 import com.moviesApp.rag.EntityExtractorService.Triple;
 import com.moviesApp.rag.JinaEmbeddingProvider;
@@ -112,6 +113,15 @@ public class KnowledgeService {
 
     private static final String GRAPH_DESIGN_PROMPT = """
             You are a knowledge graph designer. Extract a COMPREHENSIVE knowledge graph from the provided text.
+
+            CLOSED WORLD — the text is the only source of truth:
+            - Use ONLY what the text itself states. Never add anything from your own knowledge, even if
+              it is true in the real world (e.g. other films an actor appeared in, a person's birthplace,
+              a well-known fact about a famous entity).
+            - Never infer, guess, or "complete" connections. If two entities both appear in the text but
+              no sentence connects them, there is no relationship between them.
+            - Every entity must be named in the text; every relationship must be stated by one sentence of it.
+
             Return ONLY a valid JSON object — no markdown, no explanation:
             {
               "entities": [
@@ -126,7 +136,8 @@ public class KnowledgeService {
                 }
               ],
               "entityRelationships": [
-                { "from": "Entity A", "predicate": "RELATIONSHIP_TYPE", "to": "Entity B" }
+                { "from": "Entity A", "predicate": "RELATIONSHIP_TYPE", "to": "Entity B",
+                  "evidence": "The exact sentence from the text that states this relationship." }
               ]
             }
 
@@ -175,11 +186,12 @@ public class KnowledgeService {
               HAS_ROLE_INFO, HAS_CAUSE_INFO, HAS_COMPOSITION_INFO, HAS_TIMELINE_INFO
               Prefer specific types over the generic HAS_TOPIC_INFO
 
-            ENTITY RELATIONSHIPS — be exhaustive:
-            - Extract EVERY connection between entities mentioned in the text
-            - Causal/reason: CAUSED, LED_TO, RESULTED_IN, TRIGGERED, PREVENTED, REASON_FOR
-              (ENABLED/ENABLES and other reasoned-benefit predicates are always POSSIBLE_-prefixed — see
-              DEEP ANALYSIS below, never used bare here)
+            ENTITY RELATIONSHIPS — every connection the text states, nothing more:
+            - Extract every connection between entities that a sentence of the text states
+            - "evidence" MUST be ONE sentence copied verbatim from the text that names both entities.
+              No such sentence → no relationship. Relationships without valid evidence are discarded.
+            - Causal/reason: CAUSED, LED_TO, RESULTED_IN, TRIGGERED, PREVENTED, REASON_FOR, ENABLED —
+              only when the text states the cause or effect outright, never as your own reasoning
             - Temporal: PRECEDED, FOLLOWED
             - Participation: PARTICIPATED_IN, COMMANDED, DEFEATED, FOUGHT_AGAINST
             - Alliance/opposition: ALLIED_WITH, ENEMY_OF, OPPOSED
@@ -195,33 +207,19 @@ public class KnowledgeService {
             - BOOKED (and similar logistics predicates) must point at a dedicated entity (the booking/leg
               itself, e.g. "Outbound Train"), never at a composite phrase — attach the time to that entity
               separately via ARRIVES_AT / DEPARTS_AT / SCHEDULED_FOR, per the ENTITIES rule above
-            - Use these predicates as-is for connections directly stated or unambiguously implied by the
-              source text — no invented connections at this stage
-            - Aim for maximum coverage: every entity pair that interacts should have at least one relationship
-
-            DEEP ANALYSIS — go beyond what the text says outright:
-            - After extracting the direct relationships above, re-read the text as an analyst and reason
-              about causal chains, motivations, and outcomes the text implies but never states plainly —
-              e.g. an underlying motive behind a decision, a downstream effect the text doesn't spell out,
-              or a connection between two events/entities that only becomes visible when you consider the
-              text as a whole.
-            - Express each such reasoned connection as a normal entityRelationships entry — same
-              "from"/"predicate"/"to" shape — but PREFIX the predicate with "POSSIBLE_", e.g.
-              POSSIBLE_CAUSED, POSSIBLE_LED_TO, POSSIBLE_REASON_FOR, POSSIBLE_RESULTED_IN. This is how an
-              inferred connection is distinguished from one the source text actually states — never emit a
-              bare (non-prefixed) predicate for something you reasoned into existence rather than read.
-            - Do not fabricate connections between unrelated entities — every POSSIBLE_ relationship must be
-              a reasonable, defensible reading of the text, not a guess.
-            - Do not add a POSSIBLE_ duplicate of a relationship already captured as a direct one.
-            - Reasoned-benefit predicates ALWAYS take the POSSIBLE_ prefix — this is not optional: ENABLES,
-              ALLOWS, MAKES_POSSIBLE, JUSTIFIES (and similar) express a judgment about why a choice is good
-              or what it makes achievable. Even when the underlying facts are stated in an explicit
-              conditional sentence ("If they choose X, they can do Y"), turning that into "X ENABLES Y" is
-              you synthesizing a causal/evaluative claim, not quoting one — so it is always
-              POSSIBLE_ENABLES, POSSIBLE_ALLOWS, etc., never a bare ENABLES.
+            - Only connections the text states directly — never implied, reasoned, or "likely" ones, and
+              never one completed from what you know about these entities
+            - Never use a POSSIBLE_ (or any other "inferred") predicate
             """;
 
-    @Cacheable("suggestGraph")
+    // Results are cached (PostgreSQL-backed, 24h) by this key. The prefix versions the cache: a
+    // cached answer from before the closed-world rules may hold invented relationships, and must
+    // not be served for the same text again.
+    public static String suggestGraphCacheKey(String text) {
+        return "closed-world-v1:" + text;
+    }
+
+    @Cacheable(value = "suggestGraph", key = "T(com.moviesApp.service.KnowledgeService).suggestGraphCacheKey(#text)")
     public Map<String, Object> suggestGraph(String text) throws Exception {
         String response = openAi.chatDesign(GRAPH_DESIGN_PROMPT, text, 16000).strip();
         if (response.startsWith("```")) {
@@ -239,7 +237,51 @@ public class KnowledgeService {
                 }
             }
         }
+        enforceClosedWorld(result, text);
         return result;
+    }
+
+    /**
+     * Drops whatever the design LLM added beyond the text: entities the text never names, and
+     * relationships whose quoted evidence sentence isn't in the text or doesn't name both entities
+     * (plus any POSSIBLE_/inferred predicate). What was dropped is returned alongside, so the FE
+     * can show it and nothing disappears silently.
+     */
+    private static void enforceClosedWorld(Map<String, Object> result, String text) {
+        List<String> droppedEntities = new ArrayList<>();
+        if (result.get("entities") instanceof List<?> entities) {
+            List<Object> kept = new ArrayList<>();
+            for (Object e : entities) {
+                String name = e instanceof Map<?, ?> m && m.get("name") instanceof String s ? s : null;
+                if (name != null && EvidenceCheck.occursIn(text, name)) kept.add(e);
+                else if (name != null) droppedEntities.add(name);
+            }
+            result.put("entities", kept);
+        }
+
+        List<String> droppedRelationships = new ArrayList<>();
+        if (result.get("entityRelationships") instanceof List<?> rels) {
+            List<Object> kept = new ArrayList<>();
+            for (Object r : rels) {
+                if (!(r instanceof Map<?, ?> m)) continue;
+                String from = String.valueOf(m.get("from")), to = String.valueOf(m.get("to"));
+                String predicate = String.valueOf(m.get("predicate"));
+                String evidence = m.get("evidence") instanceof String s ? s : null;
+                String reason = predicate.toUpperCase(Locale.ROOT).startsWith("POSSIBLE")
+                        ? "inferred predicate"
+                        : EvidenceCheck.reject(text, evidence, from, to);
+                if (reason == null) kept.add(r);
+                else droppedRelationships.add(from + " -" + predicate + "-> " + to + " (" + reason + ")");
+            }
+            result.put("entityRelationships", kept);
+        }
+
+        if (!droppedEntities.isEmpty() || !droppedRelationships.isEmpty()) {
+            log.info("[suggest-graph] closed world: dropped entities {} and relationships {}",
+                    droppedEntities, droppedRelationships);
+        }
+        result.put("droppedEntities", droppedEntities);
+        result.put("droppedRelationships", droppedRelationships);
     }
 
     // ── Taxonomy (deep analysis, opt-in) ────────────────────────────────────────
@@ -462,6 +504,7 @@ public class KnowledgeService {
                                     "section", sectionTitle,
                                     "chunk", ci + 1, "totalChunks", chunks.size(),
                                     "chunkTriples", extracted.triples().size(),
+                                    "droppedTriples", extracted.dropped().size(),
                                     "sectionTriples", sectionTriples.size()
                             ));
                         }
@@ -1680,6 +1723,7 @@ public class KnowledgeService {
                                     "section", sectionTitle,
                                     "chunk", ci + 1, "totalChunks", chunks.size(),
                                     "chunkTriples", extracted.triples().size(),
+                                    "droppedTriples", extracted.dropped().size(),
                                     "sectionTriples", sectionTriples.size()
                             ));
                         }

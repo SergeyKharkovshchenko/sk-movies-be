@@ -42,7 +42,7 @@ public class KnowledgeController {
         try {
             String key = text.trim();
             var cache = cacheManager.getCache("suggestGraph");
-            boolean wasCached = cache != null && cache.get(key) != null;
+            boolean wasCached = cache != null && cache.get(KnowledgeService.suggestGraphCacheKey(key)) != null;
             Map<String, Object> result = new LinkedHashMap<>(knowledgeService.suggestGraph(key));
             result.put("cached", wasCached);
             return ResponseEntity.ok(result);
