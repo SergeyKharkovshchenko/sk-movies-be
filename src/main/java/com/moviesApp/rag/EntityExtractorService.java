@@ -71,19 +71,71 @@ public class EntityExtractorService {
     }
 
     public ExtractionResult extract(String text) {
-        return extract(text, List.of());
+        return extract(text, List.of(), Set.of());
     }
 
     public ExtractionResult extract(String text, List<String> canonicalNames) {
-        String prompt = canonicalNames.isEmpty() ? SYSTEM_PROMPT : SYSTEM_PROMPT +
-                "\nCANONICAL ENTITY NAMES — when any of these entities appear in the text, " +
-                "use this EXACT spelling (do not paraphrase, abbreviate, or expand):\n" +
-                String.join(", ", canonicalNames);
+        return extract(text, canonicalNames, Set.of());
+    }
+
+    /**
+     * Closed-world extraction of one chunk, in up to two passes. Pass 1 extracts the whole chunk;
+     * pass 2 re-sends only the sentences no kept triple quotes as evidence -- on dense, repetitive
+     * text (dozens of "X was released in 2017." in a row) a single pass silently skips some.
+     * Both passes are verified against the full chunk, so the second can't add anything the
+     * text doesn't state.
+     *
+     * {@code knownPredicates}: relationship types earlier chunks already used, so each chunk
+     * reuses them instead of coining synonyms (WON vs WINNED vs WON_AWARD) -- consistent types
+     * are what lets a query (and Text-to-Cypher) find every instance of a fact.
+     */
+    public ExtractionResult extract(String text, List<String> canonicalNames, Set<String> knownPredicates) {
+        Pass first = extractOnce(text, text, canonicalNames, knownPredicates);
+        if (first == null) return ExtractionResult.empty();
+
+        List<String> uncovered = EvidenceCheck.uncoveredSentences(text, first.evidences());
+        Pass second = null;
+        if (!uncovered.isEmpty()) {
+            Set<String> predicates = new LinkedHashSet<>(knownPredicates);
+            first.triples().forEach(t -> predicates.add(t.predicate()));
+            second = extractOnce(String.join(" ", uncovered), text, canonicalNames, predicates);
+        }
+
+        List<Triple> triples = new ArrayList<>(first.triples());
+        Map<String, String> descriptions = new LinkedHashMap<>(first.descriptions());
+        List<String> dropped = new ArrayList<>(first.dropped());
+        if (second != null) {
+            for (Triple t : second.triples()) if (!triples.contains(t)) triples.add(t);
+            second.descriptions().forEach(descriptions::putIfAbsent);
+            dropped.addAll(second.dropped());
+            log.info("[extract] coverage pass: {} uncovered sentence(s) -> {} more triple(s)",
+                    uncovered.size(), triples.size() - first.triples().size());
+        }
+        if (!dropped.isEmpty()) log.info("[extract] dropped {} unsupported item(s): {}", dropped.size(), dropped);
+        return new ExtractionResult(triples, descriptions, dropped);
+    }
+
+    private record Pass(List<Triple> triples, Map<String, String> descriptions, List<String> dropped,
+                        List<String> evidences) {}
+
+    /** One LLM call over {@code input}; every kept item is verified against {@code chunk}. Null on failure. */
+    private Pass extractOnce(String input, String chunk, List<String> canonicalNames, Set<String> knownPredicates) {
+        StringBuilder prompt = new StringBuilder(SYSTEM_PROMPT);
+        if (!canonicalNames.isEmpty()) {
+            prompt.append("\nCANONICAL ENTITY NAMES — when any of these entities appear in the text, ")
+                  .append("use this EXACT spelling (do not paraphrase, abbreviate, or expand):\n")
+                  .append(String.join(", ", canonicalNames));
+        }
+        if (!knownPredicates.isEmpty()) {
+            prompt.append("\nRELATIONSHIP TYPES ALREADY IN USE — when a sentence states one of these ")
+                  .append("relationships, use that exact type instead of a synonym:\n")
+                  .append(String.join(", ", knownPredicates));
+        }
         try {
             // Every triple and description carries a quoted sentence, so a dense 1500-char chunk
             // easily needs more than the 2000-token default -- a cut-off reply is unparseable JSON
             // and the whole chunk would yield nothing.
-            String response = openAi.chatExtract(prompt, text, 8000).strip();
+            String response = openAi.chatExtract(prompt.toString(), input, 8000).strip();
             if (response.startsWith("```")) {
                 response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
             }
@@ -100,6 +152,7 @@ public class EntityExtractorService {
             // chunk and names both entities -- otherwise it came from the model, not the text.
             List<Triple> triples = new ArrayList<>();
             List<String> dropped = new ArrayList<>();
+            List<String> evidences = new ArrayList<>();
             for (Map<String, String> m : rawTriples) {
                 String s = m.get("subject"), p = m.get("predicate"), o = m.get("object");
                 if (s == null || p == null || o == null) continue;
@@ -107,9 +160,10 @@ public class EntityExtractorService {
                         p.strip().toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_"),
                         o.strip());
                 if (t.subject().isEmpty() || t.predicate().isEmpty() || t.object().isEmpty()) continue;
-                String reason = EvidenceCheck.reject(text, m.get("evidence"), t.subject(), t.object());
+                String reason = EvidenceCheck.reject(chunk, m.get("evidence"), t.subject(), t.object());
                 if (reason == null) {
-                    triples.add(t);
+                    if (!triples.contains(t)) triples.add(t);
+                    evidences.add(m.get("evidence"));
                 } else {
                     dropped.add(t.subject() + " -" + t.predicate() + "-> " + t.object() + " (" + reason + ")");
                 }
@@ -125,20 +179,18 @@ public class EntityExtractorService {
             if (raw.get("descriptions") instanceof Map<?, ?> d) {
                 d.forEach((k, v) -> {
                     if (k instanceof String name && v instanceof String desc && kept.contains(name)) {
-                        String reason = EvidenceCheck.reject(text, desc, name, name);
+                        String reason = EvidenceCheck.reject(chunk, desc, name, name);
                         if (reason == null) descriptions.put(name, desc.strip());
                         else dropped.add("description of " + name + " (" + reason + ")");
                     }
                 });
             }
-
-            if (!dropped.isEmpty()) log.info("[extract] dropped {} unsupported item(s): {}", dropped.size(), dropped);
-            return new ExtractionResult(triples, descriptions, dropped);
+            return new Pass(triples, descriptions, dropped, evidences);
 
         } catch (Exception e) {
             // Was silent: a chunk that failed looked exactly like a chunk with no facts in it.
-            log.warn("[extract] extraction failed for a {}-char chunk: {}", text.length(), e.getMessage());
-            return ExtractionResult.empty();
+            log.warn("[extract] extraction failed for a {}-char input: {}", input.length(), e.getMessage());
+            return null;
         }
     }
 }

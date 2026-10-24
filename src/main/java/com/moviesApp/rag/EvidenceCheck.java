@@ -54,6 +54,25 @@ public final class EvidenceCheck {
         return new Verbatim(String.join(" ", kept), dropped);
     }
 
+    /**
+     * Sentences of the chunk that none of the kept evidence quotes cover -- candidates for a second
+     * extraction pass. Headings and fragments under three words are skipped (they state no fact).
+     */
+    public static java.util.List<String> uncoveredSentences(String chunk, java.util.List<String> evidences) {
+        java.util.List<String> covered = evidences.stream()
+                .filter(e -> e != null && !e.isBlank())
+                .map(e -> stripEndPunctuation(normalize(e)))
+                .toList();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String raw : chunk.strip().split("(?<=[.!?])\\s+|\\n\\s*\\n")) {
+            String s = raw.strip();
+            if (s.isEmpty() || s.startsWith("#") || s.split("\\s+").length < 3) continue;
+            String n = stripEndPunctuation(normalize(s));
+            if (covered.stream().noneMatch(c -> c.equals(n) || c.contains(n) || n.contains(c))) out.add(s);
+        }
+        return out;
+    }
+
     /** True when the entity name occurs in the source text (closed world for entities, too). */
     public static boolean occursIn(String sourceText, String name) {
         return mentions(normalize(sourceText), name);

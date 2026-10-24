@@ -530,6 +530,8 @@ public class KnowledgeService {
                 // 2. Per section: sub-node → relationship → chunk → extract → store → embed
                 int totalSections = sections.size();
                 Set<String> seenTripleKeys = new LinkedHashSet<>();
+                // Relationship types earlier chunks used -- passed on so later chunks reuse them.
+                Set<String> usedPredicates = new LinkedHashSet<>();
                 int totalTriples = 0;
 
                 List<String> canonicalNames = entities.stream()
@@ -580,7 +582,8 @@ public class KnowledgeService {
                             chunkIds.add(chunkId);
                             chunkTexts.add(chunkText);
 
-                            ExtractionResult extracted = extractor.extract(chunkText, canonicalNames);
+                            ExtractionResult extracted = extractor.extract(chunkText, canonicalNames, usedPredicates);
+                            extracted.triples().forEach(t -> usedPredicates.add(t.predicate()));
                             for (Triple t : extracted.triples()) {
                                 if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
                                     sectionTriples.add(t);
@@ -1405,6 +1408,8 @@ public class KnowledgeService {
             try {
                 int totalSections = sections.size();
                 Set<String> seenTripleKeys = new LinkedHashSet<>();
+                // Relationship types earlier chunks used -- passed on so later chunks reuse them.
+                Set<String> usedPredicates = new LinkedHashSet<>();
                 int totalTriples = 0;
 
                 for (int si = 0; si < totalSections; si++) {
@@ -1454,7 +1459,8 @@ public class KnowledgeService {
                             chunkIds.add(chunkId);
                             chunkTexts.add(chunkText);
 
-                            ExtractionResult extracted = extractor.extract(chunkText);
+                            ExtractionResult extracted = extractor.extract(chunkText, List.of(), usedPredicates);
+                            extracted.triples().forEach(t -> usedPredicates.add(t.predicate()));
                             for (Triple t : extracted.triples()) {
                                 if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
                                     sectionTriples.add(t);
@@ -1767,7 +1773,17 @@ public class KnowledgeService {
             Rules:
             - Every node pattern MUST include {sourceLabel: $label} -- the database holds several
               knowledge bases and $label selects this one. Use the KGNode label plus a node type,
-              e.g. (d:KGNode:Dish {sourceLabel: $label}).
+              e.g. (d:KGNode:Dish {sourceLabel: $label}) -- but ONLY types the schema lists; if it
+              lists none, use no type label at all and identify entities by their relationships.
+            - Use only relationship types the schema lists, spelled exactly; when several types
+              mean the same thing (e.g. WON and WON_AWARD), match all of them: -[:WON|WON_AWARD]->.
+            - Follow the EXAMPLE EDGES exactly: same direction, and a property such as a genre or a
+              year is usually its own node reached by an edge (match it by its exact name), never a
+              substring of the movie's name.
+            - Facts can be chains: if people are BORN_IN cities and cities are PART_OF countries,
+              "born in <country>" is (p)-[:BORN_IN]->(:KGNode)-[:PART_OF]->(:KGNode {name: '<country>'}).
+            - Names that look like numbers (years) are strings: compare with toInteger(y.name) > 2015,
+              never list the values.
             - Read-only: MATCH, OPTIONAL MATCH, WHERE, WITH, UNWIND, RETURN, ORDER BY, LIMIT and
               EXISTS { } / COUNT { } subqueries only.
             - Refer to entities by their exact names from the schema (case-sensitive), e.g.
@@ -1924,6 +1940,20 @@ public class KnowledgeService {
                         .append("  names: ").append(String.join(", ", names.subList(0, Math.min(80, names.size()))))
                         .append(names.size() > 80 ? ", ..." : "").append('\n');
             });
+            // Graphs built by direct processing have no type labels (types would be the model's
+            // classification, not the text's). Say so explicitly -- otherwise the query writer
+            // invents labels like :Director that match nothing -- and list the names instead.
+            if (sb.length() == "Node types:\n".length()) {
+                List<String> names = session.run(
+                        "MATCH (n:KGNode {sourceLabel: $l}) WHERE NOT n:Chunk AND NOT n:Section " +
+                        "RETURN n.name AS name ORDER BY name LIMIT 600",
+                        Map.of("l", label)
+                ).list(r -> r.get("name").asString());
+                sb.append("- (none) — entity nodes carry NO type label. Never write a type label: match every ")
+                  .append("entity as (x:KGNode {sourceLabel: $label}) and tell entities apart only by their ")
+                  .append("relationships, e.g. (d:KGNode {sourceLabel: $label})-[:DIRECTED]->(m:KGNode {sourceLabel: $label}).\n")
+                  .append("Entity names (exact): ").append(String.join(", ", names)).append('\n');
+            }
             sb.append("Relationship patterns (count):\n");
             session.run(
                     "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
@@ -1935,6 +1965,22 @@ public class KnowledgeService {
             ).forEachRemaining(r -> sb.append("- (").append(r.get("from").asString("?")).append(")-[:")
                     .append(r.get("rel").asString()).append("]->(").append(r.get("to").asString("?"))
                     .append(") x").append(r.get("c").asLong()).append('\n'));
+
+            // Real edges per relationship type: the query writer otherwise guesses direction
+            // ((movie)-[:DIRECTED]->(director)) and how a fact is modelled (a genre is a node
+            // "Science Fiction movie", a country is reached via BORN_IN -> city -> PART_OF).
+            sb.append("Example edges per relationship type (direction as stored):\n");
+            session.run(
+                    "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
+                    "WHERE NOT a:Chunk AND NOT b:Chunk AND NOT a:Section AND NOT b:Section " +
+                    "WITH type(r) AS rel, a.name AS from, b.name AS to ORDER BY rel, from, to " +
+                    "WITH rel, collect([from, to])[0..2] AS ex RETURN rel, ex ORDER BY rel LIMIT 60",
+                    Map.of("l", label)
+            ).forEachRemaining(r -> {
+                String rel = r.get("rel").asString();
+                List<String> ex = r.get("ex").asList(v -> "(" + v.get(0).asString() + ")-[:" + rel + "]->(" + v.get(1).asString() + ")");
+                sb.append("- ").append(String.join("; ", ex)).append('\n');
+            });
 
             // The IS_A tree (broad -> specific) with leaves summarised as counts -- lets the model
             // map a concept like "vegan" onto the right broad category instead of guessing.
