@@ -10,6 +10,9 @@ import java.util.Map;
 @Service
 public class MovieService {
 
+    public static final int DEFAULT_LIMIT = 20;
+    public static final int MAX_LIMIT = 100;
+
     private final Neo4jService neo4j;
 
     public MovieService(Neo4jService neo4j) {
@@ -17,6 +20,12 @@ public class MovieService {
     }
 
     public List<Movie> getAllMovies() {
+        return getAllMovies(DEFAULT_LIMIT);
+    }
+
+    /** Returns up to {@code limit} movies; the limit is clamped to 1..{@link #MAX_LIMIT}. */
+    public List<Movie> getAllMovies(int limit) {
+        int effectiveLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
 
         String query = "MATCH (m:Movie)<-[:REVIEWED_FROM_CSV]-(u:UserReview) " +
                 "WHERE u.rating IS NOT NULL " +
@@ -26,11 +35,11 @@ public class MovieService {
                 "MATCH (m:Movie)<-[:MOVIES]-(r:Review)" +
                 "WITH avg(r.rating) AS averageRating, m, genres " +
                 "RETURN m, genres[0] AS g0, genres[1] AS g1, genres[2] AS g2, averageRating " +
-                "LIMIT 20";
+                "LIMIT $limit";
 
         return neo4j.queryList(
                 query,
-                Map.of(),
+                Map.of("limit", effectiveLimit),
                 r -> {
                     Node movieNode = r.get("m").asNode();
                     Node genre0 = r.get("g0").isNull() ? null : r.get("g0").asNode();
