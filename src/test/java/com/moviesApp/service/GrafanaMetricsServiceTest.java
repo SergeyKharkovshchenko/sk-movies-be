@@ -70,6 +70,7 @@ class GrafanaMetricsServiceTest {
 
         assertEquals("series", out.get("kind"));
         assertEquals("ms", out.get("unit"));
+        assertEquals(3600L, (long) out.get("to") - (long) out.get("from"));
         List<Map<String, Object>> series = (List<Map<String, Object>>) out.get("series");
         assertEquals(1, series.size());
         assertEquals("/getAllMovies", series.get(0).get("label"));

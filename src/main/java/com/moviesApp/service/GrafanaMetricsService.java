@@ -129,7 +129,7 @@ public class GrafanaMetricsService {
     }
 
     /**
-     * Returns { panel, unit, kind: "stat"|"series", range, step, series: [{label, points:[[epochSec, value]]}] }.
+     * Returns { panel, unit, kind: "stat"|"series", range, step, from, to, series: [{label, points:[[epochSec, value]]}] }.
      * For a stat the series has a single one-point entry.
      */
     public Map<String, Object> query(String panelKey, String rangeKey) throws Exception {
@@ -165,6 +165,8 @@ public class GrafanaMetricsService {
         out.put("kind", panel.stat() ? "stat" : "series");
         out.put("range", rangeKey);
         out.put("step", range.stepSeconds());
+        out.put("from", start);
+        out.put("to", end);
         out.put("series", series);
         cache.put(cacheKey, new CacheEntry(Instant.now(), out));
         return out;
