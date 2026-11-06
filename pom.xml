@@ -59,6 +59,16 @@
 			<artifactId>spring-boot-starter-data-neo4j</artifactId>
 		</dependency>
 
+		<!-- Metrics: Micrometer via Actuator, pushed to Grafana Cloud over OTLP -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-otlp</artifactId>
+		</dependency>
+
 		<!-- Spring Boot Starter Web (optional, if you have REST controllers) -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
