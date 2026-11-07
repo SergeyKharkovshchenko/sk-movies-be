@@ -2561,7 +2561,8 @@ public class KnowledgeService {
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                    "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                    "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                    "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                     "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit),
@@ -2575,7 +2576,9 @@ public class KnowledgeService {
                         "relationship", relType,
                         "neighbor",     neighborName,
                         "neighborText", r.get("neighborText").asString(""),
-                        "neighborDesc", r.get("neighborDesc").asString("")
+                        "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                 ));
                 expanded.add(nodeName);
                 if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
@@ -2650,7 +2653,8 @@ public class KnowledgeService {
                 runTraced(session, "1-hop expansion from \"" + name + "\"",
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                    "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", neighborLimit),
@@ -2663,7 +2667,9 @@ public class KnowledgeService {
                             "relationship", relType,
                             "neighbor",     neighborName,
                             "neighborText", r.get("neighborText").asString(""),
-                            "neighborDesc", r.get("neighborDesc").asString("")
+                            "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                     ));
                     if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
                         twoHopSeeds.add(neighborName);
@@ -2710,7 +2716,8 @@ public class KnowledgeService {
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                        "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'IS_A' THEN 0 ELSE 1 END, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", perNodeLimit),
@@ -2722,12 +2729,40 @@ public class KnowledgeService {
                             "relationship", r.get("relType").asString(""),
                             "neighbor",     neighborName,
                             "neighborText", "",
-                            "neighborDesc", r.get("neighborDesc").asString("")
+                            "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                     ));
                     if (!alreadyExpanded.contains(neighborName)) nextFrontier.add(neighborName);
                 });
             }
             frontier = nextFrontier;
+        }
+    }
+
+    private static final Set<String> HIDDEN_PROPS =
+            Set.of("sourceLabel", "nodeType", "csvTables", "inferredBy", "name", "text", "description", "inferred", "via");
+
+    /** "k=v, k=v" of a node's own data properties (internal bookkeeping and long text left out); "" if none. */
+    static String formatProps(Map<String, Object> props) {
+        if (props == null) return "";
+        return new TreeMap<>(props).entrySet().stream()
+                .filter(en -> !HIDDEN_PROPS.contains(en.getKey()) && en.getValue() != null)
+                .map(en -> {
+                    String v = String.valueOf(en.getValue());
+                    return en.getKey() + "=" + (v.length() > 120 ? v.substring(0, 120) + "..." : v);
+                })
+                .collect(Collectors.joining(", "));
+    }
+
+    private static String propsLine(Record r, String column) {
+        Value v = r.get(column);
+        return v == null || v.isNull() ? "" : formatProps(v.asMap());
+    }
+
+    private static void appendProps(StringBuilder sb, Set<String> shown, String name, String props) {
+        if (props != null && !props.isEmpty() && shown.add(name)) {
+            sb.append("  [").append(name).append(" properties: ").append(props).append("]\n");
         }
     }
 
@@ -2749,6 +2784,7 @@ public class KnowledgeService {
 
         if (!triplets.isEmpty()) {
             sb.append("=== KNOWLEDGE GRAPH RELATIONSHIPS (").append(label).append(") ===\n");
+            Set<String> propsShown = new HashSet<>();
             for (Map<String, Object> e : triplets) {
                 String desc         = (String) e.getOrDefault("neighborDesc", "");
                 String neighborText = (String) e.getOrDefault("neighborText", "");
@@ -2766,6 +2802,10 @@ public class KnowledgeService {
                             ? neighborText.substring(0, 500) + "..." : neighborText;
                     sb.append("  [").append(snippet).append("]\n");
                 }
+                // CSV rows keep their values (amounts, prices, ...) as node properties, which the
+                // triplet text above does not show -- without them an aggregation has nothing to add up.
+                appendProps(sb, propsShown, String.valueOf(e.get("node")), (String) e.getOrDefault("nodeProps", ""));
+                appendProps(sb, propsShown, neighbor, (String) e.getOrDefault("neighborProps", ""));
             }
         }
 
