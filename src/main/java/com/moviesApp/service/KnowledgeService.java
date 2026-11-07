@@ -1100,6 +1100,7 @@ public class KnowledgeService {
         }
 
         int embedded = embedCsvRows(label, embedNames, embedIds, embedTexts);
+        embedded += embedInferredCategorySentences(label);
 
         triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
 
@@ -1187,6 +1188,40 @@ public class KnowledgeService {
             }
         }
         return total;
+    }
+
+    /**
+     * Writes each derived `*_CATEGORY` edge (see {@link #inferHierarchyRelationships}) as a plain
+     * sentence into the vector store, e.g. "Tiramisu includes ingredient dairy (via mascarpone)".
+     * Row sentences only state what one CSV row says ("Tiramisu ... mascarpone", "mascarpone ... dairy");
+     * the join of the two files exists only as graph edges, so without this vector search cannot find
+     * "dishes with dairy" in one hit. Deterministic -- no LLM, only what the files already imply.
+     */
+    private int embedInferredCategorySentences(String label) throws Exception {
+        List<String> names = new ArrayList<>(), ids = new ArrayList<>(), texts = new ArrayList<>();
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (a:KGNode {sourceLabel: $l})-[x]->(c:KGNode {sourceLabel: $l}) " +
+                            "WHERE x.inferred = true AND type(x) ENDS WITH '_CATEGORY' " +
+                            "RETURN a.name AS a, type(x) AS t, c.name AS c, coalesce(x.via, []) AS via " +
+                            "ORDER BY a, t, c",
+                    Map.of("l", label)
+            ).forEachRemaining(r -> {
+                String a = r.get("a").asString(), t = r.get("t").asString(), c = r.get("c").asString();
+                List<String> via = r.get("via").asList(v -> v.asString());
+                names.add(a + " [" + c + "]");
+                ids.add(label + "_inf_" + Math.abs((a + "|" + t + "|" + c).hashCode()));
+                texts.add(inferredCategorySentence(a, t, c, via));
+            });
+        }
+        return embedCsvRows(label, names, ids, texts);
+    }
+
+    /** "Tiramisu" + INCLUDES_INGREDIENT_CATEGORY + "dairy" + [mascarpone] -> "Tiramisu includes ingredient dairy (via mascarpone)". */
+    static String inferredCategorySentence(String from, String relType, String category, List<String> via) {
+        String rel = relType.replaceFirst("_CATEGORY$", "").toLowerCase().replace('_', ' ');
+        String sentence = from + " " + rel + " " + category;
+        return via == null || via.isEmpty() ? sentence : sentence + " (via " + String.join(", ", via) + ")";
     }
 
     private static CsvTableProfile profileCsvTable(CsvTable table) {
