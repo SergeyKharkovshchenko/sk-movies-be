@@ -1178,7 +1178,7 @@ public class KnowledgeService {
      * "which dishes contain seafood?" needs dish -> shrimp -> shellfish -> seafood and back.
      * Runs over the whole knowledge base, so it also links CSVs imported in separate uploads.
      */
-    int inferHierarchyRelationships(String label) {
+    public int inferHierarchyRelationships(String label) {
         int total = 0;
         try (Session session = driver.session()) { // Neo4j
             List<String> relTypes = session.run(
@@ -1213,7 +1213,7 @@ public class KnowledgeService {
      * the join of the two files exists only as graph edges, so without this vector search cannot find
      * "dishes with dairy" in one hit. Deterministic -- no LLM, only what the files already imply.
      */
-    int embedInferredCategorySentences(String label) throws Exception {
+    public int embedInferredCategorySentences(String label) throws Exception {
         List<String> names = new ArrayList<>(), ids = new ArrayList<>(), texts = new ArrayList<>();
         try (Session session = driver.session()) { // Neo4j
             session.run(
@@ -2358,7 +2358,7 @@ public class KnowledgeService {
 
     // ── Chunking ──────────────────────────────────────────────────────────────
 
-    List<String> chunk(String text) {
+    public List<String> chunk(String text) {
         // Split on sentence boundaries so extraction never sees a half-sentence
         String[] sentences = text.split("(?<=[.!?])\\s+");
         List<String> chunks  = new ArrayList<>();
@@ -2416,7 +2416,7 @@ public class KnowledgeService {
 
     // Creates a Chunk node in Neo4j and links it to its parent section via HAS_CHUNK.
     // Returns the chunk's unique name so it can be used as the PostgreSQL embedding key.
-    String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
+    public String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
                                   String label, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String chunkId   = sectionTitle + "::chunk::" + chunkIdx;
@@ -2452,7 +2452,7 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label));
     }
 
-    void createSectionSubNode(String sectionTitle, String forEntity,
+    public void createSectionSubNode(String sectionTitle, String forEntity,
                                       String sectionRelationship, String label, String text, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
@@ -2491,7 +2491,7 @@ public class KnowledgeService {
 
     // ── Neo4j queries ─────────────────────────────────────────────────────────
 
-    long countNodes(String label) {
+    public long countNodes(String label) {
         try (Session session = driver.session()) { // Neo4j
             return session.run(
                     "MATCH (n:KGNode {sourceLabel: $l}) RETURN count(n) AS c", Map.of("l", label)
@@ -2832,7 +2832,7 @@ public class KnowledgeService {
      * Embeds one section's artifacts the way processGraph does: the entity names that appear in it
      * (graph-mode seeds) and the raw chunk texts (passage retrieval). Returns how many were embedded.
      */
-    int embedSectionArtifacts(String label, String sectionTitle, List<String> entityNames,
+    public int embedSectionArtifacts(String label, String sectionTitle, List<String> entityNames,
                               List<String> chunkIds, List<String> chunkTexts) throws Exception {
         List<String> toEmbed = Stream.concat(Stream.of(sectionTitle), entityNames.stream())
                 .distinct().collect(Collectors.toList());
@@ -2865,21 +2865,21 @@ public class KnowledgeService {
     }
 
     /** Mirrors the finished graph to TriplyDB (async, failures only logged). */
-    void mirror(String label) {
+    public void mirror(String label) {
         triply.syncGraphAsync(label);
     }
 
-    ExecutorService executor() {
+    public ExecutorService executor() {
         return executor;
     }
 
-    Session openSession() {
+    public Session openSession() {
         return driver.session(); // Neo4j
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    void send(SseEmitter emitter, String event, Object data) throws IOException {
+    public void send(SseEmitter emitter, String event, Object data) throws IOException {
         emitter.send(SseEmitter.event().name(event).data(objectMapper.writeValueAsString(data)));
     }
 
