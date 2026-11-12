@@ -261,6 +261,20 @@ public class KnowledgeController {
         }
     }
 
+    /** Detail panel data for one node: properties, aliases, definition, in/out edges, taxonomy. */
+    @GetMapping("/knowledge/graph/{label}/node")
+    public ResponseEntity<Map<String, Object>> node(@PathVariable String label, @RequestParam String name) {
+        try {
+            Map<String, Object> details = knowledgeService.nodeDetails(label, name);
+            return details == null
+                    ? ResponseEntity.status(404).body(Map.of("error", "node not found"))
+                    : ResponseEntity.ok(details);
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
     /**
      * Parent-child pairs only (from the opt-in "deep analysis" taxonomy step at process time),
      * for the FE's collapsible hierarchy tree -- same { parent, child } shape as /relations.

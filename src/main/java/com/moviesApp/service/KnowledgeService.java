@@ -2314,11 +2314,14 @@ public class KnowledgeService {
         List<Map<String, Object>> edges = new ArrayList<>();
         try (Session session = driver.session()) { // Neo4j
             session.run(
-                    "MATCH (n:KGNode {sourceLabel: $l}) RETURN n.name AS name, labels(n) AS labels",
+                    "MATCH (n:KGNode {sourceLabel: $l}) RETURN n.name AS name, labels(n) AS labels, " +
+                            "coalesce(n.nodeType, '') AS nodeType, coalesce(n.description, '') AS description",
                     Map.of("l", label)
             ).forEachRemaining(record -> {
                 Map<String, Object> node = new LinkedHashMap<>();
                 node.put("id", record.get("name").asString());
+                node.put("nodeType", record.get("nodeType").asString(""));
+                node.put("description", record.get("description").asString(""));
                 node.put("labels", record.get("labels").asList(Value::asString).stream()
                         .filter(l -> !l.equals("KGNode"))
                         .toList());
@@ -2327,17 +2330,66 @@ public class KnowledgeService {
 
             session.run(
                     "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
-                            "RETURN a.name AS source, b.name AS target, type(r) AS type",
+                            "RETURN a.name AS source, b.name AS target, type(r) AS type, " +
+                            "coalesce(r.inferred, false) AS inferred",
                     Map.of("l", label)
             ).forEachRemaining(record -> {
                 Map<String, Object> edge = new LinkedHashMap<>();
                 edge.put("source", record.get("source").asString());
                 edge.put("target", record.get("target").asString());
                 edge.put("type", record.get("type").asString());
+                edge.put("inferred", record.get("inferred").asBoolean(false));
                 edges.add(edge);
             });
         }
+        GraphShape.addDegrees(nodes, edges);
         return Map.of("nodes", nodes, "edges", edges);
+    }
+
+    /** Everything the UI shows in a node's detail panel; null when the node does not exist. */
+    public Map<String, Object> nodeDetails(String label, String name) {
+        Map<String, Object> params = Map.of("l", label, "name", name);
+        try (Session session = driver.session()) { // Neo4j
+            Record node = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) RETURN labels(n) AS labels, properties(n) AS props",
+                    params).stream().findFirst().orElse(null);
+            if (node == null) return null;
+            List<String> labels = node.get("labels").asList(Value::asString).stream()
+                    .filter(l -> !l.equals("KGNode")).toList();
+
+            String edgeQuery = "MATCH %s RETURN type(r) AS t, m.name AS other, " +
+                    "coalesce(r.inferred, false) AS inferred, r.via AS via ORDER BY t, other LIMIT 200";
+            List<Map<String, Object>> outgoing = session.run(
+                    String.format(edgeQuery, "(n:KGNode {name: $name, sourceLabel: $l})-[r]->(m:KGNode {sourceLabel: $l})"),
+                    params).list(KnowledgeService::edgeRow);
+            List<Map<String, Object>> incoming = session.run(
+                    String.format(edgeQuery, "(m:KGNode {sourceLabel: $l})-[r]->(n:KGNode {name: $name, sourceLabel: $l})"),
+                    params).list(KnowledgeService::edgeRow);
+
+            // Taxonomy: text imports use (parent)-[:PARENT_OF]->(child), CSV imports (child)-[:IS_A]->(parent).
+            List<String> ancestors = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (n)-[:IS_A*1..5]->(a:KGNode {sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (p:KGNode {sourceLabel: $l})-[:PARENT_OF*1..5]->(n) " +
+                            "RETURN collect(DISTINCT a.name) + collect(DISTINCT p.name) AS names",
+                    params).single().get("names").asList(Value::asString).stream()
+                    .filter(Objects::nonNull).distinct().toList();
+            List<String> children = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (c:KGNode {sourceLabel: $l})-[:IS_A]->(n) " +
+                            "OPTIONAL MATCH (n)-[:PARENT_OF]->(d:KGNode {sourceLabel: $l}) " +
+                            "RETURN collect(DISTINCT c.name) + collect(DISTINCT d.name) AS names",
+                    params).single().get("names").asList(Value::asString).stream()
+                    .filter(Objects::nonNull).distinct().toList();
+
+            return GraphShape.details(name, labels, node.get("props").asMap(), outgoing, incoming, ancestors, children);
+        }
+    }
+
+    private static Map<String, Object> edgeRow(Record r) {
+        return GraphShape.edgeEntry(r.get("t").asString(), r.get("other").asString(),
+                r.get("inferred").asBoolean(false),
+                r.get("via").isNull() ? List.of() : r.get("via").asList(Value::asString));
     }
 
     // ── Chunking ──────────────────────────────────────────────────────────────
@@ -2740,8 +2792,8 @@ public class KnowledgeService {
         }
     }
 
-    private static final Set<String> HIDDEN_PROPS =
-            Set.of("sourceLabel", "nodeType", "csvTables", "inferredBy", "name", "text", "description", "inferred", "via");
+    private static final Set<String> HIDDEN_PROPS = Stream.concat(GraphShape.HIDDEN_PROPS.stream(),
+            Stream.of("name", "text", "description")).collect(Collectors.toUnmodifiableSet());
 
     /** "k=v, k=v" of a node's own data properties (internal bookkeeping and long text left out); "" if none. */
     static String formatProps(Map<String, Object> props) {
