@@ -40,6 +40,7 @@ final class CsvOntologyProposer {
                 t.put("type", type);
                 t.put("aliases", List.of());
                 t.put("definition", "");
+                t.put("origin", "csv"); // renaming would orphan the imported node, so the UI keeps the name fixed
                 return t;
             });
         }

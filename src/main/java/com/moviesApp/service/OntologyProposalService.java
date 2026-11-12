@@ -125,6 +125,7 @@ public class OntologyProposalService {
             term.put("type", str(e, "type").isEmpty() ? "Entity" : str(e, "type"));
             term.put("aliases", aliases);
             term.put("definition", definition);
+            term.put("origin", "text");
             terms.add(term);
         }
 

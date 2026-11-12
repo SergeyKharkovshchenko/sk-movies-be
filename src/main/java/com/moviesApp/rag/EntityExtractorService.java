@@ -63,10 +63,22 @@ public class EntityExtractorService {
 
     public record Triple(String subject, String predicate, String object) {}
 
-    /** {@code dropped}: triples the LLM proposed that failed the evidence check, with the reason. */
-    public record ExtractionResult(List<Triple> triples, Map<String, String> descriptions, List<String> dropped) {
+    /**
+     * {@code dropped}: triples the LLM proposed that failed the evidence check, with the reason.
+     * {@code evidence}: the quoted sentence of every kept triple, keyed "subject|predicate|object".
+     */
+    public record ExtractionResult(List<Triple> triples, Map<String, String> descriptions, List<String> dropped,
+                                   Map<String, String> evidence) {
+        public ExtractionResult(List<Triple> triples, Map<String, String> descriptions, List<String> dropped) {
+            this(triples, descriptions, dropped, Map.of());
+        }
+
         public static ExtractionResult empty() {
-            return new ExtractionResult(List.of(), Map.of(), List.of());
+            return new ExtractionResult(List.of(), Map.of(), List.of(), Map.of());
+        }
+
+        public static String evidenceKey(Triple t) {
+            return t.subject() + "|" + t.predicate() + "|" + t.object();
         }
     }
 
@@ -75,10 +87,23 @@ public class EntityExtractorService {
     }
 
     public ExtractionResult extract(String text, List<String> canonicalNames) {
+        return extract(text, canonicalNames, List.of());
+    }
+
+    /**
+     * Strict-ontology extraction: {@code allowedRelations} lists the only predicates that may be
+     * used, each as "PREDICATE (SubjectClass -> ObjectClass)". A fact that fits none is omitted.
+     */
+    public ExtractionResult extract(String text, List<String> canonicalNames, List<String> allowedRelations) {
         String prompt = canonicalNames.isEmpty() ? SYSTEM_PROMPT : SYSTEM_PROMPT +
                 "\nCANONICAL ENTITY NAMES — when any of these entities appear in the text, " +
                 "use this EXACT spelling (do not paraphrase, abbreviate, or expand):\n" +
                 String.join(", ", canonicalNames);
+        if (!allowedRelations.isEmpty()) {
+            prompt += "\n\nSTRICT ONTOLOGY — use ONLY these predicates, and only between entities of the " +
+                    "classes shown. A stated fact that fits none of them must be left out, never forced into " +
+                    "another predicate and never given a new one:\n" + String.join("\n", allowedRelations);
+        }
         try {
             // Every triple and description carries a quoted sentence, so a dense 1500-char chunk
             // easily needs more than the 2000-token default -- a cut-off reply is unparseable JSON
@@ -99,6 +124,7 @@ public class EntityExtractorService {
             // Closed world, enforced: keep a triple only if its quoted sentence is really in this
             // chunk and names both entities -- otherwise it came from the model, not the text.
             List<Triple> triples = new ArrayList<>();
+            Map<String, String> evidence = new LinkedHashMap<>();
             List<String> dropped = new ArrayList<>();
             for (Map<String, String> m : rawTriples) {
                 String s = m.get("subject"), p = m.get("predicate"), o = m.get("object");
@@ -110,6 +136,7 @@ public class EntityExtractorService {
                 String reason = EvidenceCheck.reject(text, m.get("evidence"), t.subject(), t.object());
                 if (reason == null) {
                     triples.add(t);
+                    evidence.put(ExtractionResult.evidenceKey(t), m.get("evidence").strip());
                 } else {
                     dropped.add(t.subject() + " -" + t.predicate() + "-> " + t.object() + " (" + reason + ")");
                 }
@@ -133,7 +160,7 @@ public class EntityExtractorService {
             }
 
             if (!dropped.isEmpty()) log.info("[extract] dropped {} unsupported item(s): {}", dropped.size(), dropped);
-            return new ExtractionResult(triples, descriptions, dropped);
+            return new ExtractionResult(triples, descriptions, dropped, evidence);
 
         } catch (Exception e) {
             // Was silent: a chunk that failed looked exactly like a chunk with no facts in it.

@@ -1,8 +1,10 @@
 package com.moviesApp.controllers;
 
 import com.moviesApp.service.OntologyDraftService;
+import com.moviesApp.service.OntologyPopulationService;
 import com.moviesApp.service.OntologyProposalService;
 import com.moviesApp.service.OntologyStage;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -13,6 +15,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
 import java.util.Map;
 
 /** Drafts of the ontology pipeline: one editable, approvable payload per stage and knowledge base. */
@@ -22,10 +26,13 @@ public class OntologyController {
 
     private final OntologyDraftService drafts;
     private final OntologyProposalService proposals;
+    private final OntologyPopulationService population;
 
-    public OntologyController(OntologyDraftService drafts, OntologyProposalService proposals) {
+    public OntologyController(OntologyDraftService drafts, OntologyProposalService proposals,
+                              OntologyPopulationService population) {
         this.drafts = drafts;
         this.proposals = proposals;
+        this.population = population;
     }
 
     @GetMapping
@@ -73,6 +80,17 @@ public class OntologyController {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
+    }
+
+    /**
+     * Builds the graph from the approved stages (SSE). Body: {"replace": true} to rebuild an existing graph.
+     * Events: stage_start, terms_written, section_start, extract_progress, triple_rejected, section_done,
+     * csv_imported, reconciled, complete, already_exists, error.
+     */
+    @PostMapping(value = "/populate", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter populate(@PathVariable String label, @RequestBody(required = false) Map<String, Object> body) {
+        boolean replace = body != null && Boolean.TRUE.equals(body.get("replace"));
+        return population.populate(label, replace);
     }
 
     @DeleteMapping
