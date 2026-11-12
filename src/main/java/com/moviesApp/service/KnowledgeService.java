@@ -421,6 +421,34 @@ public class KnowledgeService {
             return Map.of("count", 0, "pairs", List.of(), "dropped", List.of());
         }
 
+        Map<String, Object> proposal = proposeTaxonomy(entityNames, sourceText);
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> validPairs = (List<Map<String, String>>) proposal.get("pairs");
+        List<?> dropped = (List<?>) proposal.get("dropped");
+
+        try (Session session = driver.session()) { // Neo4j
+            for (Map<String, String> pair : validPairs) {
+                session.run(
+                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                "MERGE (p)-[:PARENT_OF]->(c)",
+                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
+                );
+            }
+        }
+
+        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+    }
+
+    /**
+     * Asks the LLM for the parent-child structure the source text states among the given entity
+     * names and keeps only the pairs that pass the closed-world checks (see detectAndStoreTaxonomy).
+     * Writes nothing: returns {pairs: [{parent, child, evidence}], dropped: [reasons]}.
+     */
+    public Map<String, Object> proposeTaxonomy(List<String> entityNames, String sourceText) throws Exception {
+        if (entityNames.size() < 2 || sourceText == null || sourceText.isBlank()) {
+            return Map.of("pairs", List.of(), "dropped", List.of());
+        }
         String input = "SOURCE TEXT:\n" + sourceText + "\n\nENTITY NAMES:\n" +
                 entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
         String response = openAi.chatDesign(TAXONOMY_PROMPT, input, 16000).strip();
@@ -454,22 +482,10 @@ public class KnowledgeService {
                 continue;
             }
             parentOf.put(child, parent);
-            validPairs.add(Map.of("parent", parent, "child", child));
+            validPairs.add(Map.of("parent", parent, "child", child, "evidence", evidence == null ? "" : evidence));
         }
         if (!dropped.isEmpty()) log.info("[taxonomy] closed world: dropped {} pair(s): {}", dropped.size(), dropped);
-
-        try (Session session = driver.session()) { // Neo4j
-            for (Map<String, String> pair : validPairs) {
-                session.run(
-                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                                "MERGE (p)-[:PARENT_OF]->(c)",
-                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
-                );
-            }
-        }
-
-        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+        return Map.of("pairs", validPairs, "dropped", dropped);
     }
 
     /**
@@ -894,7 +910,7 @@ public class KnowledgeService {
         return result;
     }
 
-    private record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
+    record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
 
     private int embedCsvRows(String label, List<String> names, List<String> ids, List<String> texts) throws Exception {
         if (names.isEmpty()) return 0;
@@ -941,9 +957,9 @@ public class KnowledgeService {
     // Once all rows are written, inferHierarchyRelationships() combines what the files share --
     // see there.
 
-    private enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
+    enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
 
-    private record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
+    record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
                                    Map<String, CsvColumnRole> roles) {}
 
     private record CsvEdge(String from, String type, String to) {}
@@ -951,7 +967,7 @@ public class KnowledgeService {
     private static final Pattern CSV_HIERARCHY_COLUMN = Pattern.compile(
             "(?i)^(parent([_ ]?(name|id))?|broader|is[_ ]?a|subclass[_ ]?of|super([_ ]?(class|type|category))?)$");
     private static final Pattern CSV_TYPE_COLUMN      = Pattern.compile("(?i)^(.+[_ ])?(type|kind|class)$");
-    private static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
+    static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
     private static final int     MAX_HIERARCHY_DEPTH  = 8;
     private static final Pattern CSV_PLACEHOLDER_NAME = Pattern.compile("(?i)null|none|n/?a|unknown|other|misc(ellaneous)?|-");
 
@@ -1162,7 +1178,7 @@ public class KnowledgeService {
      * "which dishes contain seafood?" needs dish -> shrimp -> shellfish -> seafood and back.
      * Runs over the whole knowledge base, so it also links CSVs imported in separate uploads.
      */
-    private int inferHierarchyRelationships(String label) {
+    public int inferHierarchyRelationships(String label) {
         int total = 0;
         try (Session session = driver.session()) { // Neo4j
             List<String> relTypes = session.run(
@@ -1197,7 +1213,7 @@ public class KnowledgeService {
      * the join of the two files exists only as graph edges, so without this vector search cannot find
      * "dishes with dairy" in one hit. Deterministic -- no LLM, only what the files already imply.
      */
-    private int embedInferredCategorySentences(String label) throws Exception {
+    public int embedInferredCategorySentences(String label) throws Exception {
         List<String> names = new ArrayList<>(), ids = new ArrayList<>(), texts = new ArrayList<>();
         try (Session session = driver.session()) { // Neo4j
             session.run(
@@ -1224,7 +1240,7 @@ public class KnowledgeService {
         return via == null || via.isEmpty() ? sentence : sentence + " (via " + String.join(", ", via) + ")";
     }
 
-    private static CsvTableProfile profileCsvTable(CsvTable table) {
+    static CsvTableProfile profileCsvTable(CsvTable table) {
         String keyCol = table.headers().get(0);
         String typeCol = null;
         Map<String, CsvColumnRole> roles = new LinkedHashMap<>();
@@ -1256,7 +1272,7 @@ public class KnowledgeService {
         return new CsvTableProfile(table, keyCol, typeCol, csvPascal(csvSingular(keyCol)), roles);
     }
 
-    private static String rowType(CsvTableProfile p, Map<String, String> row) {
+    static String rowType(CsvTableProfile p, Map<String, String> row) {
         String t = p.typeCol() != null ? row.get(p.typeCol()) : null;
         return t != null && !t.isBlank() ? csvPascal(t) : p.defaultType();
     }
@@ -1275,7 +1291,7 @@ public class KnowledgeService {
     }
 
     /** Label for hierarchy parents that never appear as rows ("animal product"): the most common label among those that do. */
-    private static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
+    static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
         return distinctValues(table, col).stream()
                 .map(v -> nodeTypes.get(csvKey(v)))
                 .filter(Objects::nonNull)
@@ -1284,17 +1300,17 @@ public class KnowledgeService {
                 .map(Map.Entry::getKey).orElse("Category");
     }
 
-    private static Set<String> distinctValues(CsvTable table, String col) {
+    static Set<String> distinctValues(CsvTable table, String col) {
         return table.rows().stream().map(r -> r.get(col))
                 .filter(v -> v != null && !v.isBlank()).map(String::trim)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
-    private static String csvKey(String name) {
+    static String csvKey(String name) {
         return name.trim().toLowerCase(Locale.ROOT);
     }
 
-    private static boolean isCsvNumber(String v) {
+    static boolean isCsvNumber(String v) {
         return v.matches("-?\\d+(\\.\\d+)?");
     }
 
@@ -1302,7 +1318,7 @@ public class KnowledgeService {
         return v.contains(".") ? (Object) Double.parseDouble(v) : (Object) Long.parseLong(v);
     }
 
-    private static String csvSingular(String word) {
+    static String csvSingular(String word) {
         String w = word.trim(), l = w.toLowerCase(Locale.ROOT);
         if (l.endsWith("ies") && w.length() > 3) return w.substring(0, w.length() - 3) + "y";
         if (l.matches(".*(ss|sh|ch|x|z)es$")) return w.substring(0, w.length() - 2);
@@ -1310,7 +1326,7 @@ public class KnowledgeService {
         return w;
     }
 
-    private static String csvPascal(String s) {
+    static String csvPascal(String s) {
         String out = Arrays.stream(s.trim().split("[^A-Za-z0-9]+"))
                 .filter(p -> !p.isEmpty())
                 .map(p -> Character.toUpperCase(p.charAt(0)) + p.substring(1))
@@ -1318,7 +1334,7 @@ public class KnowledgeService {
         return out.isEmpty() ? "Entity" : out;
     }
 
-    private static String csvRelName(String column) {
+    static String csvRelName(String column) {
         String rel = column.trim().replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "").toUpperCase(Locale.ROOT);
         rel = rel.replaceFirst("^HAS_", "");
         return rel.isEmpty() ? "RELATED_TO" : rel;
@@ -1359,15 +1375,15 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label, "props", props != null ? props : Map.of()));
     }
 
-    private static String sanitizeNeo4jName(String s) {
+    static String sanitizeNeo4jName(String s) {
         return s.replaceAll("[^a-zA-Z0-9]", "_");
     }
 
-    private static String stripIdentifierSuffix(String column) {
+    static String stripIdentifierSuffix(String column) {
         return column.replaceAll("(?i)_Identifier$", "");
     }
 
-    private static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
+    static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
                                                        Collection<String> exclude) {
         Map<String, Object> props = new LinkedHashMap<>();
         for (String h : headers) {
@@ -1395,7 +1411,7 @@ public class KnowledgeService {
 
     // RFC4180-ish: handles quoted fields (commas/quotes inside quotes). First line is headers;
     // duplicate header names collapse to one key (last value wins) since rows are keyed by a Map.
-    private static List<Map<String, String>> parseCsv(String content) {
+    static List<Map<String, String>> parseCsv(String content) {
         List<String> lines = Arrays.stream(content.split("\\r?\\n")).filter(l -> !l.isEmpty()).toList();
         if (lines.size() < 2) return List.of();
         List<String> headers = splitCsvLine(lines.get(0));
@@ -2342,7 +2358,7 @@ public class KnowledgeService {
 
     // ── Chunking ──────────────────────────────────────────────────────────────
 
-    private List<String> chunk(String text) {
+    public List<String> chunk(String text) {
         // Split on sentence boundaries so extraction never sees a half-sentence
         String[] sentences = text.split("(?<=[.!?])\\s+");
         List<String> chunks  = new ArrayList<>();
@@ -2400,7 +2416,7 @@ public class KnowledgeService {
 
     // Creates a Chunk node in Neo4j and links it to its parent section via HAS_CHUNK.
     // Returns the chunk's unique name so it can be used as the PostgreSQL embedding key.
-    private String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
+    public String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
                                   String label, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String chunkId   = sectionTitle + "::chunk::" + chunkIdx;
@@ -2436,7 +2452,7 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label));
     }
 
-    private void createSectionSubNode(String sectionTitle, String forEntity,
+    public void createSectionSubNode(String sectionTitle, String forEntity,
                                       String sectionRelationship, String label, String text, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
@@ -2475,7 +2491,7 @@ public class KnowledgeService {
 
     // ── Neo4j queries ─────────────────────────────────────────────────────────
 
-    private long countNodes(String label) {
+    public long countNodes(String label) {
         try (Session session = driver.session()) { // Neo4j
             return session.run(
                     "MATCH (n:KGNode {sourceLabel: $l}) RETURN count(n) AS c", Map.of("l", label)
@@ -2812,9 +2828,58 @@ public class KnowledgeService {
         return sb.isEmpty() ? "No relevant knowledge graph context found for: " + label : sb.toString();
     }
 
+    /**
+     * Embeds one section's artifacts the way processGraph does: the entity names that appear in it
+     * (graph-mode seeds) and the raw chunk texts (passage retrieval). Returns how many were embedded.
+     */
+    public int embedSectionArtifacts(String label, String sectionTitle, List<String> entityNames,
+                              List<String> chunkIds, List<String> chunkTexts) throws Exception {
+        List<String> toEmbed = Stream.concat(Stream.of(sectionTitle), entityNames.stream())
+                .distinct().collect(Collectors.toList());
+        repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, toEmbed); // PostgreSQL
+        int embedded = 0;
+        for (int i = 0; i < toEmbed.size(); i += EMBED_BATCH) {
+            List<String> batch = toEmbed.subList(i, Math.min(i + EMBED_BATCH, toEmbed.size()));
+            List<float[]> vectors = jina.embed(batch);
+            List<BikeEmbedding> rows = new ArrayList<>();
+            for (int j = 0; j < batch.size(); j++) {
+                String name = batch.get(j);
+                rows.add(new BikeEmbedding(SOURCE_TYPE, label + "_" + Math.abs(name.hashCode()), name, label, name,
+                        floatArrayToVectorString(vectors.get(j)), "jina", vectors.get(j).length));
+            }
+            repository.saveAll(rows); // PostgreSQL
+            embedded += batch.size();
+        }
+        if (!chunkTexts.isEmpty()) {
+            List<float[]> vectors = jina.embed(chunkTexts);
+            List<BikeEmbedding> rows = new ArrayList<>();
+            for (int ci = 0; ci < chunkIds.size(); ci++) {
+                rows.add(new BikeEmbedding(CHUNK_SOURCE_TYPE, label + "_ck_" + Math.abs(chunkIds.get(ci).hashCode()),
+                        chunkIds.get(ci), label, chunkTexts.get(ci),
+                        floatArrayToVectorString(vectors.get(ci)), "jina", vectors.get(ci).length));
+            }
+            repository.saveAll(rows); // PostgreSQL
+            embedded += chunkTexts.size();
+        }
+        return embedded;
+    }
+
+    /** Mirrors the finished graph to TriplyDB (async, failures only logged). */
+    public void mirror(String label) {
+        triply.syncGraphAsync(label);
+    }
+
+    public ExecutorService executor() {
+        return executor;
+    }
+
+    public Session openSession() {
+        return driver.session(); // Neo4j
+    }
+
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    private void send(SseEmitter emitter, String event, Object data) throws IOException {
+    public void send(SseEmitter emitter, String event, Object data) throws IOException {
         emitter.send(SseEmitter.event().name(event).data(objectMapper.writeValueAsString(data)));
     }
 
