@@ -421,6 +421,34 @@ public class KnowledgeService {
             return Map.of("count", 0, "pairs", List.of(), "dropped", List.of());
         }
 
+        Map<String, Object> proposal = proposeTaxonomy(entityNames, sourceText);
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> validPairs = (List<Map<String, String>>) proposal.get("pairs");
+        List<?> dropped = (List<?>) proposal.get("dropped");
+
+        try (Session session = driver.session()) { // Neo4j
+            for (Map<String, String> pair : validPairs) {
+                session.run(
+                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                "MERGE (p)-[:PARENT_OF]->(c)",
+                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
+                );
+            }
+        }
+
+        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+    }
+
+    /**
+     * Asks the LLM for the parent-child structure the source text states among the given entity
+     * names and keeps only the pairs that pass the closed-world checks (see detectAndStoreTaxonomy).
+     * Writes nothing: returns {pairs: [{parent, child, evidence}], dropped: [reasons]}.
+     */
+    public Map<String, Object> proposeTaxonomy(List<String> entityNames, String sourceText) throws Exception {
+        if (entityNames.size() < 2 || sourceText == null || sourceText.isBlank()) {
+            return Map.of("pairs", List.of(), "dropped", List.of());
+        }
         String input = "SOURCE TEXT:\n" + sourceText + "\n\nENTITY NAMES:\n" +
                 entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
         String response = openAi.chatDesign(TAXONOMY_PROMPT, input, 16000).strip();
@@ -454,22 +482,10 @@ public class KnowledgeService {
                 continue;
             }
             parentOf.put(child, parent);
-            validPairs.add(Map.of("parent", parent, "child", child));
+            validPairs.add(Map.of("parent", parent, "child", child, "evidence", evidence == null ? "" : evidence));
         }
         if (!dropped.isEmpty()) log.info("[taxonomy] closed world: dropped {} pair(s): {}", dropped.size(), dropped);
-
-        try (Session session = driver.session()) { // Neo4j
-            for (Map<String, String> pair : validPairs) {
-                session.run(
-                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                                "MERGE (p)-[:PARENT_OF]->(c)",
-                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
-                );
-            }
-        }
-
-        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+        return Map.of("pairs", validPairs, "dropped", dropped);
     }
 
     /**
