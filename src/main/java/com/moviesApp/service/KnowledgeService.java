@@ -894,7 +894,7 @@ public class KnowledgeService {
         return result;
     }
 
-    private record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
+    record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
 
     private int embedCsvRows(String label, List<String> names, List<String> ids, List<String> texts) throws Exception {
         if (names.isEmpty()) return 0;
@@ -941,9 +941,9 @@ public class KnowledgeService {
     // Once all rows are written, inferHierarchyRelationships() combines what the files share --
     // see there.
 
-    private enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
+    enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
 
-    private record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
+    record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
                                    Map<String, CsvColumnRole> roles) {}
 
     private record CsvEdge(String from, String type, String to) {}
@@ -951,7 +951,7 @@ public class KnowledgeService {
     private static final Pattern CSV_HIERARCHY_COLUMN = Pattern.compile(
             "(?i)^(parent([_ ]?(name|id))?|broader|is[_ ]?a|subclass[_ ]?of|super([_ ]?(class|type|category))?)$");
     private static final Pattern CSV_TYPE_COLUMN      = Pattern.compile("(?i)^(.+[_ ])?(type|kind|class)$");
-    private static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
+    static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
     private static final int     MAX_HIERARCHY_DEPTH  = 8;
     private static final Pattern CSV_PLACEHOLDER_NAME = Pattern.compile("(?i)null|none|n/?a|unknown|other|misc(ellaneous)?|-");
 
@@ -1224,7 +1224,7 @@ public class KnowledgeService {
         return via == null || via.isEmpty() ? sentence : sentence + " (via " + String.join(", ", via) + ")";
     }
 
-    private static CsvTableProfile profileCsvTable(CsvTable table) {
+    static CsvTableProfile profileCsvTable(CsvTable table) {
         String keyCol = table.headers().get(0);
         String typeCol = null;
         Map<String, CsvColumnRole> roles = new LinkedHashMap<>();
@@ -1256,7 +1256,7 @@ public class KnowledgeService {
         return new CsvTableProfile(table, keyCol, typeCol, csvPascal(csvSingular(keyCol)), roles);
     }
 
-    private static String rowType(CsvTableProfile p, Map<String, String> row) {
+    static String rowType(CsvTableProfile p, Map<String, String> row) {
         String t = p.typeCol() != null ? row.get(p.typeCol()) : null;
         return t != null && !t.isBlank() ? csvPascal(t) : p.defaultType();
     }
@@ -1275,7 +1275,7 @@ public class KnowledgeService {
     }
 
     /** Label for hierarchy parents that never appear as rows ("animal product"): the most common label among those that do. */
-    private static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
+    static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
         return distinctValues(table, col).stream()
                 .map(v -> nodeTypes.get(csvKey(v)))
                 .filter(Objects::nonNull)
@@ -1284,17 +1284,17 @@ public class KnowledgeService {
                 .map(Map.Entry::getKey).orElse("Category");
     }
 
-    private static Set<String> distinctValues(CsvTable table, String col) {
+    static Set<String> distinctValues(CsvTable table, String col) {
         return table.rows().stream().map(r -> r.get(col))
                 .filter(v -> v != null && !v.isBlank()).map(String::trim)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
-    private static String csvKey(String name) {
+    static String csvKey(String name) {
         return name.trim().toLowerCase(Locale.ROOT);
     }
 
-    private static boolean isCsvNumber(String v) {
+    static boolean isCsvNumber(String v) {
         return v.matches("-?\\d+(\\.\\d+)?");
     }
 
@@ -1302,7 +1302,7 @@ public class KnowledgeService {
         return v.contains(".") ? (Object) Double.parseDouble(v) : (Object) Long.parseLong(v);
     }
 
-    private static String csvSingular(String word) {
+    static String csvSingular(String word) {
         String w = word.trim(), l = w.toLowerCase(Locale.ROOT);
         if (l.endsWith("ies") && w.length() > 3) return w.substring(0, w.length() - 3) + "y";
         if (l.matches(".*(ss|sh|ch|x|z)es$")) return w.substring(0, w.length() - 2);
@@ -1310,7 +1310,7 @@ public class KnowledgeService {
         return w;
     }
 
-    private static String csvPascal(String s) {
+    static String csvPascal(String s) {
         String out = Arrays.stream(s.trim().split("[^A-Za-z0-9]+"))
                 .filter(p -> !p.isEmpty())
                 .map(p -> Character.toUpperCase(p.charAt(0)) + p.substring(1))
@@ -1318,7 +1318,7 @@ public class KnowledgeService {
         return out.isEmpty() ? "Entity" : out;
     }
 
-    private static String csvRelName(String column) {
+    static String csvRelName(String column) {
         String rel = column.trim().replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "").toUpperCase(Locale.ROOT);
         rel = rel.replaceFirst("^HAS_", "");
         return rel.isEmpty() ? "RELATED_TO" : rel;
@@ -1359,15 +1359,15 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label, "props", props != null ? props : Map.of()));
     }
 
-    private static String sanitizeNeo4jName(String s) {
+    static String sanitizeNeo4jName(String s) {
         return s.replaceAll("[^a-zA-Z0-9]", "_");
     }
 
-    private static String stripIdentifierSuffix(String column) {
+    static String stripIdentifierSuffix(String column) {
         return column.replaceAll("(?i)_Identifier$", "");
     }
 
-    private static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
+    static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
                                                        Collection<String> exclude) {
         Map<String, Object> props = new LinkedHashMap<>();
         for (String h : headers) {
@@ -1395,7 +1395,7 @@ public class KnowledgeService {
 
     // RFC4180-ish: handles quoted fields (commas/quotes inside quotes). First line is headers;
     // duplicate header names collapse to one key (last value wins) since rows are keyed by a Map.
-    private static List<Map<String, String>> parseCsv(String content) {
+    static List<Map<String, String>> parseCsv(String content) {
         List<String> lines = Arrays.stream(content.split("\\r?\\n")).filter(l -> !l.isEmpty()).toList();
         if (lines.size() < 2) return List.of();
         List<String> headers = splitCsvLine(lines.get(0));
