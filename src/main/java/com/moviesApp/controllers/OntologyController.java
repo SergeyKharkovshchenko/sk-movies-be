@@ -1,0 +1,105 @@
+package com.moviesApp.controllers;
+
+import com.moviesApp.service.OntologyDraftService;
+import com.moviesApp.service.OntologyPopulationService;
+import com.moviesApp.service.OntologyProposalService;
+import com.moviesApp.service.OntologyStage;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.util.Map;
+
+/** Drafts of the ontology pipeline: one editable, approvable payload per stage and knowledge base. */
+@RestController
+@RequestMapping("/knowledge/ontology/{label}")
+public class OntologyController {
+
+    private final OntologyDraftService drafts;
+    private final OntologyProposalService proposals;
+    private final OntologyPopulationService population;
+
+    public OntologyController(OntologyDraftService drafts, OntologyProposalService proposals,
+                              OntologyPopulationService population) {
+        this.drafts = drafts;
+        this.proposals = proposals;
+        this.population = population;
+    }
+
+    @GetMapping
+    public Map<String, Object> overview(@PathVariable String label) {
+        return drafts.overview(label);
+    }
+
+    @GetMapping("/{stage}")
+    public ResponseEntity<Map<String, Object>> stage(@PathVariable String label, @PathVariable String stage) {
+        return OntologyStage.parse(stage)
+                .map(s -> ResponseEntity.ok(drafts.stage(label, s)))
+                .orElseGet(() -> unknownStage());
+    }
+
+    @PutMapping("/{stage}")
+    public ResponseEntity<Map<String, Object>> save(
+            @PathVariable String label, @PathVariable String stage, @RequestBody Map<String, Object> payload) {
+        return OntologyStage.parse(stage)
+                .map(s -> ResponseEntity.ok(drafts.save(label, s, payload)))
+                .orElseGet(() -> unknownStage());
+    }
+
+    @PostMapping("/{stage}/approve")
+    public ResponseEntity<Map<String, Object>> approve(@PathVariable String label, @PathVariable String stage) {
+        return OntologyStage.parse(stage).map(s -> {
+            Map<String, Object> result = drafts.approve(label, s);
+            return Boolean.TRUE.equals(result.get("approved"))
+                    ? ResponseEntity.ok(result)
+                    : ResponseEntity.unprocessableEntity().body(result);
+        }).orElseGet(() -> unknownStage());
+    }
+
+    /** Builds a proposal for the stage from the approved earlier ones and saves it as the stage's draft. */
+    @PostMapping("/{stage}/propose")
+    public ResponseEntity<Map<String, Object>> propose(@PathVariable String label, @PathVariable String stage) {
+        OntologyStage parsed = OntologyStage.parse(stage).orElse(null);
+        if (parsed == null) return unknownStage();
+        try {
+            return ResponseEntity.ok(proposals.propose(label, parsed));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * Builds the graph from the approved stages (SSE). Body: {"replace": true} to rebuild an existing graph.
+     * Events: stage_start, terms_written, section_start, extract_progress, triple_rejected, section_done,
+     * csv_imported, reconciled, complete, already_exists, error.
+     */
+    @PostMapping(value = "/populate", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter populate(@PathVariable String label, @RequestBody(required = false) Map<String, Object> body) {
+        boolean replace = body != null && Boolean.TRUE.equals(body.get("replace"));
+        return population.populate(label, replace);
+    }
+
+    @DeleteMapping
+    public Map<String, Object> reset(@PathVariable String label) {
+        drafts.reset(label);
+        return Map.of("label", label, "reset", true);
+    }
+
+    private static ResponseEntity<Map<String, Object>> unknownStage() {
+        return ResponseEntity.badRequest().body(Map.of("error", "unknown stage"));
+    }
+}

@@ -421,6 +421,34 @@ public class KnowledgeService {
             return Map.of("count", 0, "pairs", List.of(), "dropped", List.of());
         }
 
+        Map<String, Object> proposal = proposeTaxonomy(entityNames, sourceText);
+        @SuppressWarnings("unchecked")
+        List<Map<String, String>> validPairs = (List<Map<String, String>>) proposal.get("pairs");
+        List<?> dropped = (List<?>) proposal.get("dropped");
+
+        try (Session session = driver.session()) { // Neo4j
+            for (Map<String, String> pair : validPairs) {
+                session.run(
+                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
+                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
+                                "MERGE (p)-[:PARENT_OF]->(c)",
+                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
+                );
+            }
+        }
+
+        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+    }
+
+    /**
+     * Asks the LLM for the parent-child structure the source text states among the given entity
+     * names and keeps only the pairs that pass the closed-world checks (see detectAndStoreTaxonomy).
+     * Writes nothing: returns {pairs: [{parent, child, evidence}], dropped: [reasons]}.
+     */
+    public Map<String, Object> proposeTaxonomy(List<String> entityNames, String sourceText) throws Exception {
+        if (entityNames.size() < 2 || sourceText == null || sourceText.isBlank()) {
+            return Map.of("pairs", List.of(), "dropped", List.of());
+        }
         String input = "SOURCE TEXT:\n" + sourceText + "\n\nENTITY NAMES:\n" +
                 entityNames.stream().map(n -> "- " + n).collect(Collectors.joining("\n"));
         String response = openAi.chatDesign(TAXONOMY_PROMPT, input, 16000).strip();
@@ -454,22 +482,10 @@ public class KnowledgeService {
                 continue;
             }
             parentOf.put(child, parent);
-            validPairs.add(Map.of("parent", parent, "child", child));
+            validPairs.add(Map.of("parent", parent, "child", child, "evidence", evidence == null ? "" : evidence));
         }
         if (!dropped.isEmpty()) log.info("[taxonomy] closed world: dropped {} pair(s): {}", dropped.size(), dropped);
-
-        try (Session session = driver.session()) { // Neo4j
-            for (Map<String, String> pair : validPairs) {
-                session.run(
-                        "MATCH (p:KGNode {name: $parent, sourceLabel: $label}) " +
-                                "MATCH (c:KGNode {name: $child, sourceLabel: $label}) " +
-                                "MERGE (p)-[:PARENT_OF]->(c)",
-                        Map.of("parent", pair.get("parent"), "child", pair.get("child"), "label", label)
-                );
-            }
-        }
-
-        return Map.of("count", validPairs.size(), "pairs", validPairs, "dropped", dropped);
+        return Map.of("pairs", validPairs, "dropped", dropped);
     }
 
     /**
@@ -582,7 +598,7 @@ public class KnowledgeService {
                             chunkIds.add(chunkId);
                             chunkTexts.add(chunkText);
 
-                            ExtractionResult extracted = extractor.extract(chunkText, canonicalNames, usedPredicates);
+                            ExtractionResult extracted = extractor.extract(chunkText, canonicalNames);
                             extracted.triples().forEach(t -> usedPredicates.add(t.predicate()));
                             for (Triple t : extracted.triples()) {
                                 if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
@@ -897,7 +913,7 @@ public class KnowledgeService {
         return result;
     }
 
-    private record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
+    record CsvTable(String name, List<String> headers, List<Map<String, String>> rows) {}
 
     private int embedCsvRows(String label, List<String> names, List<String> ids, List<String> texts) throws Exception {
         if (names.isEmpty()) return 0;
@@ -944,9 +960,9 @@ public class KnowledgeService {
     // Once all rows are written, inferHierarchyRelationships() combines what the files share --
     // see there.
 
-    private enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
+    enum CsvColumnRole { HIERARCHY, NUMBER, LIST, REFERENCE, CATEGORY, PROPERTY }
 
-    private record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
+    record CsvTableProfile(CsvTable table, String keyCol, String typeCol, String defaultType,
                                    Map<String, CsvColumnRole> roles) {}
 
     private record CsvEdge(String from, String type, String to) {}
@@ -954,7 +970,7 @@ public class KnowledgeService {
     private static final Pattern CSV_HIERARCHY_COLUMN = Pattern.compile(
             "(?i)^(parent([_ ]?(name|id))?|broader|is[_ ]?a|subclass[_ ]?of|super([_ ]?(class|type|category))?)$");
     private static final Pattern CSV_TYPE_COLUMN      = Pattern.compile("(?i)^(.+[_ ])?(type|kind|class)$");
-    private static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
+    static final Pattern CSV_LIST_SEPARATOR   = Pattern.compile("\\s*[;|]\\s*");
     private static final int     MAX_HIERARCHY_DEPTH  = 8;
     private static final Pattern CSV_PLACEHOLDER_NAME = Pattern.compile("(?i)null|none|n/?a|unknown|other|misc(ellaneous)?|-");
 
@@ -1103,6 +1119,7 @@ public class KnowledgeService {
         }
 
         int embedded = embedCsvRows(label, embedNames, embedIds, embedTexts);
+        embedded += embedInferredCategorySentences(label);
 
         triply.syncGraphAsync(label); // TriplyDB mirror -- async, failures only logged
 
@@ -1164,7 +1181,7 @@ public class KnowledgeService {
      * "which dishes contain seafood?" needs dish -> shrimp -> shellfish -> seafood and back.
      * Runs over the whole knowledge base, so it also links CSVs imported in separate uploads.
      */
-    private int inferHierarchyRelationships(String label) {
+    public int inferHierarchyRelationships(String label) {
         int total = 0;
         try (Session session = driver.session()) { // Neo4j
             List<String> relTypes = session.run(
@@ -1192,7 +1209,41 @@ public class KnowledgeService {
         return total;
     }
 
-    private static CsvTableProfile profileCsvTable(CsvTable table) {
+    /**
+     * Writes each derived `*_CATEGORY` edge (see {@link #inferHierarchyRelationships}) as a plain
+     * sentence into the vector store, e.g. "Tiramisu includes ingredient dairy (via mascarpone)".
+     * Row sentences only state what one CSV row says ("Tiramisu ... mascarpone", "mascarpone ... dairy");
+     * the join of the two files exists only as graph edges, so without this vector search cannot find
+     * "dishes with dairy" in one hit. Deterministic -- no LLM, only what the files already imply.
+     */
+    public int embedInferredCategorySentences(String label) throws Exception {
+        List<String> names = new ArrayList<>(), ids = new ArrayList<>(), texts = new ArrayList<>();
+        try (Session session = driver.session()) { // Neo4j
+            session.run(
+                    "MATCH (a:KGNode {sourceLabel: $l})-[x]->(c:KGNode {sourceLabel: $l}) " +
+                            "WHERE x.inferred = true AND type(x) ENDS WITH '_CATEGORY' " +
+                            "RETURN a.name AS a, type(x) AS t, c.name AS c, coalesce(x.via, []) AS via " +
+                            "ORDER BY a, t, c",
+                    Map.of("l", label)
+            ).forEachRemaining(r -> {
+                String a = r.get("a").asString(), t = r.get("t").asString(), c = r.get("c").asString();
+                List<String> via = r.get("via").asList(v -> v.asString());
+                names.add(a + " [" + c + "]");
+                ids.add(label + "_inf_" + Math.abs((a + "|" + t + "|" + c).hashCode()));
+                texts.add(inferredCategorySentence(a, t, c, via));
+            });
+        }
+        return embedCsvRows(label, names, ids, texts);
+    }
+
+    /** "Tiramisu" + INCLUDES_INGREDIENT_CATEGORY + "dairy" + [mascarpone] -> "Tiramisu includes ingredient dairy (via mascarpone)". */
+    static String inferredCategorySentence(String from, String relType, String category, List<String> via) {
+        String rel = relType.replaceFirst("_CATEGORY$", "").toLowerCase().replace('_', ' ');
+        String sentence = from + " " + rel + " " + category;
+        return via == null || via.isEmpty() ? sentence : sentence + " (via " + String.join(", ", via) + ")";
+    }
+
+    static CsvTableProfile profileCsvTable(CsvTable table) {
         String keyCol = table.headers().get(0);
         String typeCol = null;
         Map<String, CsvColumnRole> roles = new LinkedHashMap<>();
@@ -1224,7 +1275,7 @@ public class KnowledgeService {
         return new CsvTableProfile(table, keyCol, typeCol, csvPascal(csvSingular(keyCol)), roles);
     }
 
-    private static String rowType(CsvTableProfile p, Map<String, String> row) {
+    static String rowType(CsvTableProfile p, Map<String, String> row) {
         String t = p.typeCol() != null ? row.get(p.typeCol()) : null;
         return t != null && !t.isBlank() ? csvPascal(t) : p.defaultType();
     }
@@ -1243,7 +1294,7 @@ public class KnowledgeService {
     }
 
     /** Label for hierarchy parents that never appear as rows ("animal product"): the most common label among those that do. */
-    private static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
+    static String dominantKnownType(CsvTable table, String col, Map<String, String> nodeTypes) {
         return distinctValues(table, col).stream()
                 .map(v -> nodeTypes.get(csvKey(v)))
                 .filter(Objects::nonNull)
@@ -1252,17 +1303,17 @@ public class KnowledgeService {
                 .map(Map.Entry::getKey).orElse("Category");
     }
 
-    private static Set<String> distinctValues(CsvTable table, String col) {
+    static Set<String> distinctValues(CsvTable table, String col) {
         return table.rows().stream().map(r -> r.get(col))
                 .filter(v -> v != null && !v.isBlank()).map(String::trim)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
-    private static String csvKey(String name) {
+    static String csvKey(String name) {
         return name.trim().toLowerCase(Locale.ROOT);
     }
 
-    private static boolean isCsvNumber(String v) {
+    static boolean isCsvNumber(String v) {
         return v.matches("-?\\d+(\\.\\d+)?");
     }
 
@@ -1270,7 +1321,7 @@ public class KnowledgeService {
         return v.contains(".") ? (Object) Double.parseDouble(v) : (Object) Long.parseLong(v);
     }
 
-    private static String csvSingular(String word) {
+    static String csvSingular(String word) {
         String w = word.trim(), l = w.toLowerCase(Locale.ROOT);
         if (l.endsWith("ies") && w.length() > 3) return w.substring(0, w.length() - 3) + "y";
         if (l.matches(".*(ss|sh|ch|x|z)es$")) return w.substring(0, w.length() - 2);
@@ -1278,7 +1329,7 @@ public class KnowledgeService {
         return w;
     }
 
-    private static String csvPascal(String s) {
+    static String csvPascal(String s) {
         String out = Arrays.stream(s.trim().split("[^A-Za-z0-9]+"))
                 .filter(p -> !p.isEmpty())
                 .map(p -> Character.toUpperCase(p.charAt(0)) + p.substring(1))
@@ -1286,7 +1337,7 @@ public class KnowledgeService {
         return out.isEmpty() ? "Entity" : out;
     }
 
-    private static String csvRelName(String column) {
+    static String csvRelName(String column) {
         String rel = column.trim().replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "").toUpperCase(Locale.ROOT);
         rel = rel.replaceFirst("^HAS_", "");
         return rel.isEmpty() ? "RELATED_TO" : rel;
@@ -1327,15 +1378,15 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label, "props", props != null ? props : Map.of()));
     }
 
-    private static String sanitizeNeo4jName(String s) {
+    static String sanitizeNeo4jName(String s) {
         return s.replaceAll("[^a-zA-Z0-9]", "_");
     }
 
-    private static String stripIdentifierSuffix(String column) {
+    static String stripIdentifierSuffix(String column) {
         return column.replaceAll("(?i)_Identifier$", "");
     }
 
-    private static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
+    static Map<String, Object> rowProperties(Map<String, String> row, List<String> headers,
                                                        Collection<String> exclude) {
         Map<String, Object> props = new LinkedHashMap<>();
         for (String h : headers) {
@@ -1363,7 +1414,7 @@ public class KnowledgeService {
 
     // RFC4180-ish: handles quoted fields (commas/quotes inside quotes). First line is headers;
     // duplicate header names collapse to one key (last value wins) since rows are keyed by a Map.
-    private static List<Map<String, String>> parseCsv(String content) {
+    static List<Map<String, String>> parseCsv(String content) {
         List<String> lines = Arrays.stream(content.split("\\r?\\n")).filter(l -> !l.isEmpty()).toList();
         if (lines.size() < 2) return List.of();
         List<String> headers = splitCsvLine(lines.get(0));
@@ -1459,7 +1510,7 @@ public class KnowledgeService {
                             chunkIds.add(chunkId);
                             chunkTexts.add(chunkText);
 
-                            ExtractionResult extracted = extractor.extract(chunkText, List.of(), usedPredicates);
+                            ExtractionResult extracted = extractor.extract(chunkText, List.of());
                             extracted.triples().forEach(t -> usedPredicates.add(t.predicate()));
                             for (Triple t : extracted.triples()) {
                                 if (seenTripleKeys.add(t.subject() + "|" + t.predicate() + "|" + t.object())) {
@@ -2325,11 +2376,14 @@ public class KnowledgeService {
         List<Map<String, Object>> edges = new ArrayList<>();
         try (Session session = driver.session()) { // Neo4j
             session.run(
-                    "MATCH (n:KGNode {sourceLabel: $l}) RETURN n.name AS name, labels(n) AS labels",
+                    "MATCH (n:KGNode {sourceLabel: $l}) RETURN n.name AS name, labels(n) AS labels, " +
+                            "coalesce(n.nodeType, '') AS nodeType, coalesce(n.description, '') AS description",
                     Map.of("l", label)
             ).forEachRemaining(record -> {
                 Map<String, Object> node = new LinkedHashMap<>();
                 node.put("id", record.get("name").asString());
+                node.put("nodeType", record.get("nodeType").asString(""));
+                node.put("description", record.get("description").asString(""));
                 node.put("labels", record.get("labels").asList(Value::asString).stream()
                         .filter(l -> !l.equals("KGNode"))
                         .toList());
@@ -2338,22 +2392,71 @@ public class KnowledgeService {
 
             session.run(
                     "MATCH (a:KGNode {sourceLabel: $l})-[r]->(b:KGNode {sourceLabel: $l}) " +
-                            "RETURN a.name AS source, b.name AS target, type(r) AS type",
+                            "RETURN a.name AS source, b.name AS target, type(r) AS type, " +
+                            "coalesce(r.inferred, false) AS inferred",
                     Map.of("l", label)
             ).forEachRemaining(record -> {
                 Map<String, Object> edge = new LinkedHashMap<>();
                 edge.put("source", record.get("source").asString());
                 edge.put("target", record.get("target").asString());
                 edge.put("type", record.get("type").asString());
+                edge.put("inferred", record.get("inferred").asBoolean(false));
                 edges.add(edge);
             });
         }
+        GraphShape.addDegrees(nodes, edges);
         return Map.of("nodes", nodes, "edges", edges);
+    }
+
+    /** Everything the UI shows in a node's detail panel; null when the node does not exist. */
+    public Map<String, Object> nodeDetails(String label, String name) {
+        Map<String, Object> params = Map.of("l", label, "name", name);
+        try (Session session = driver.session()) { // Neo4j
+            Record node = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) RETURN labels(n) AS labels, properties(n) AS props",
+                    params).stream().findFirst().orElse(null);
+            if (node == null) return null;
+            List<String> labels = node.get("labels").asList(Value::asString).stream()
+                    .filter(l -> !l.equals("KGNode")).toList();
+
+            String edgeQuery = "MATCH %s RETURN type(r) AS t, m.name AS other, " +
+                    "coalesce(r.inferred, false) AS inferred, r.via AS via ORDER BY t, other LIMIT 200";
+            List<Map<String, Object>> outgoing = session.run(
+                    String.format(edgeQuery, "(n:KGNode {name: $name, sourceLabel: $l})-[r]->(m:KGNode {sourceLabel: $l})"),
+                    params).list(KnowledgeService::edgeRow);
+            List<Map<String, Object>> incoming = session.run(
+                    String.format(edgeQuery, "(m:KGNode {sourceLabel: $l})-[r]->(n:KGNode {name: $name, sourceLabel: $l})"),
+                    params).list(KnowledgeService::edgeRow);
+
+            // Taxonomy: text imports use (parent)-[:PARENT_OF]->(child), CSV imports (child)-[:IS_A]->(parent).
+            List<String> ancestors = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (n)-[:IS_A*1..5]->(a:KGNode {sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (p:KGNode {sourceLabel: $l})-[:PARENT_OF*1..5]->(n) " +
+                            "RETURN collect(DISTINCT a.name) + collect(DISTINCT p.name) AS names",
+                    params).single().get("names").asList(Value::asString).stream()
+                    .filter(Objects::nonNull).distinct().toList();
+            List<String> children = session.run(
+                    "MATCH (n:KGNode {name: $name, sourceLabel: $l}) " +
+                            "OPTIONAL MATCH (c:KGNode {sourceLabel: $l})-[:IS_A]->(n) " +
+                            "OPTIONAL MATCH (n)-[:PARENT_OF]->(d:KGNode {sourceLabel: $l}) " +
+                            "RETURN collect(DISTINCT c.name) + collect(DISTINCT d.name) AS names",
+                    params).single().get("names").asList(Value::asString).stream()
+                    .filter(Objects::nonNull).distinct().toList();
+
+            return GraphShape.details(name, labels, node.get("props").asMap(), outgoing, incoming, ancestors, children);
+        }
+    }
+
+    private static Map<String, Object> edgeRow(Record r) {
+        return GraphShape.edgeEntry(r.get("t").asString(), r.get("other").asString(),
+                r.get("inferred").asBoolean(false),
+                r.get("via").isNull() ? List.of() : r.get("via").asList(Value::asString));
     }
 
     // ── Chunking ──────────────────────────────────────────────────────────────
 
-    private List<String> chunk(String text) {
+    public List<String> chunk(String text) {
         // Split on sentence boundaries so extraction never sees a half-sentence
         String[] sentences = text.split("(?<=[.!?])\\s+");
         List<String> chunks  = new ArrayList<>();
@@ -2411,7 +2514,7 @@ public class KnowledgeService {
 
     // Creates a Chunk node in Neo4j and links it to its parent section via HAS_CHUNK.
     // Returns the chunk's unique name so it can be used as the PostgreSQL embedding key.
-    private String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
+    public String storeChunkNode(String chunkText, int chunkIdx, String sectionTitle,
                                   String label, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String chunkId   = sectionTitle + "::chunk::" + chunkIdx;
@@ -2447,7 +2550,7 @@ public class KnowledgeService {
                 Map.of("name", name, "label", label));
     }
 
-    private void createSectionSubNode(String sectionTitle, String forEntity,
+    public void createSectionSubNode(String sectionTitle, String forEntity,
                                       String sectionRelationship, String label, String text, Session session) {
         String safeLabel = label.replaceAll("[^a-zA-Z0-9]", "_");
         String safeRel   = sectionRelationship.toUpperCase().replaceAll("[^A-Z0-9]", "_").replaceAll("_{2,}", "_");
@@ -2486,7 +2589,7 @@ public class KnowledgeService {
 
     // ── Neo4j queries ─────────────────────────────────────────────────────────
 
-    private long countNodes(String label) {
+    public long countNodes(String label) {
         try (Session session = driver.session()) { // Neo4j
             return session.run(
                     "MATCH (n:KGNode {sourceLabel: $l}) RETURN count(n) AS c", Map.of("l", label)
@@ -2572,7 +2675,8 @@ public class KnowledgeService {
                     "MATCH (n:KGNode {sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                     "WHERE any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw) " +
                     "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                    "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                    "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                    "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                     "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                     "LIMIT $limit",
                     Map.of("label", label, "keywords", keywords, "limit", topK * neighborLimit),
@@ -2586,7 +2690,9 @@ public class KnowledgeService {
                         "relationship", relType,
                         "neighbor",     neighborName,
                         "neighborText", r.get("neighborText").asString(""),
-                        "neighborDesc", r.get("neighborDesc").asString("")
+                        "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                 ));
                 expanded.add(nodeName);
                 if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
@@ -2661,7 +2767,8 @@ public class KnowledgeService {
                 runTraced(session, "1-hop expansion from \"" + name + "\"",
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "coalesce(nb.text, '') AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                    "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'HAS_' THEN 1 ELSE 0 END ASC, n.name, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", neighborLimit),
@@ -2674,7 +2781,9 @@ public class KnowledgeService {
                             "relationship", relType,
                             "neighbor",     neighborName,
                             "neighborText", r.get("neighborText").asString(""),
-                            "neighborDesc", r.get("neighborDesc").asString("")
+                            "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                     ));
                     if (!relType.startsWith("HAS_") && !expanded.contains(neighborName))
                         twoHopSeeds.add(neighborName);
@@ -2721,7 +2830,8 @@ public class KnowledgeService {
                         "MATCH (n:KGNode {name: $name, sourceLabel: $label})-[r]-(nb:KGNode {sourceLabel: $label}) " +
                         "WHERE NOT type(r) STARTS WITH 'HAS_' AND NOT type(r) = 'HAS_CHUNK' " +
                         "RETURN n.name AS node, type(r) AS relType, nb.name AS neighborName, " +
-                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc " +
+                        "'' AS neighborText, coalesce(nb.description, '') AS neighborDesc, " +
+                        "properties(n) AS nodeProps, properties(nb) AS neighborProps " +
                         "ORDER BY CASE WHEN type(r) STARTS WITH 'IS_A' THEN 0 ELSE 1 END, relType, neighborName " +
                         "LIMIT $limit",
                         Map.of("name", name, "label", label, "limit", perNodeLimit),
@@ -2733,12 +2843,40 @@ public class KnowledgeService {
                             "relationship", r.get("relType").asString(""),
                             "neighbor",     neighborName,
                             "neighborText", "",
-                            "neighborDesc", r.get("neighborDesc").asString("")
+                            "neighborDesc", r.get("neighborDesc").asString(""),
+                        "nodeProps",    propsLine(r, "nodeProps"),
+                        "neighborProps", propsLine(r, "neighborProps")
                     ));
                     if (!alreadyExpanded.contains(neighborName)) nextFrontier.add(neighborName);
                 });
             }
             frontier = nextFrontier;
+        }
+    }
+
+    private static final Set<String> HIDDEN_PROPS = Stream.concat(GraphShape.HIDDEN_PROPS.stream(),
+            Stream.of("name", "text", "description")).collect(Collectors.toUnmodifiableSet());
+
+    /** "k=v, k=v" of a node's own data properties (internal bookkeeping and long text left out); "" if none. */
+    static String formatProps(Map<String, Object> props) {
+        if (props == null) return "";
+        return new TreeMap<>(props).entrySet().stream()
+                .filter(en -> !HIDDEN_PROPS.contains(en.getKey()) && en.getValue() != null)
+                .map(en -> {
+                    String v = String.valueOf(en.getValue());
+                    return en.getKey() + "=" + (v.length() > 120 ? v.substring(0, 120) + "..." : v);
+                })
+                .collect(Collectors.joining(", "));
+    }
+
+    private static String propsLine(Record r, String column) {
+        Value v = r.get(column);
+        return v == null || v.isNull() ? "" : formatProps(v.asMap());
+    }
+
+    private static void appendProps(StringBuilder sb, Set<String> shown, String name, String props) {
+        if (props != null && !props.isEmpty() && shown.add(name)) {
+            sb.append("  [").append(name).append(" properties: ").append(props).append("]\n");
         }
     }
 
@@ -2760,6 +2898,7 @@ public class KnowledgeService {
 
         if (!triplets.isEmpty()) {
             sb.append("=== KNOWLEDGE GRAPH RELATIONSHIPS (").append(label).append(") ===\n");
+            Set<String> propsShown = new HashSet<>();
             for (Map<String, Object> e : triplets) {
                 String desc         = (String) e.getOrDefault("neighborDesc", "");
                 String neighborText = (String) e.getOrDefault("neighborText", "");
@@ -2777,15 +2916,68 @@ public class KnowledgeService {
                             ? neighborText.substring(0, 500) + "..." : neighborText;
                     sb.append("  [").append(snippet).append("]\n");
                 }
+                // CSV rows keep their values (amounts, prices, ...) as node properties, which the
+                // triplet text above does not show -- without them an aggregation has nothing to add up.
+                appendProps(sb, propsShown, String.valueOf(e.get("node")), (String) e.getOrDefault("nodeProps", ""));
+                appendProps(sb, propsShown, neighbor, (String) e.getOrDefault("neighborProps", ""));
             }
         }
 
         return sb.isEmpty() ? "No relevant knowledge graph context found for: " + label : sb.toString();
     }
 
+    /**
+     * Embeds one section's artifacts the way processGraph does: the entity names that appear in it
+     * (graph-mode seeds) and the raw chunk texts (passage retrieval). Returns how many were embedded.
+     */
+    public int embedSectionArtifacts(String label, String sectionTitle, List<String> entityNames,
+                              List<String> chunkIds, List<String> chunkTexts) throws Exception {
+        List<String> toEmbed = Stream.concat(Stream.of(sectionTitle), entityNames.stream())
+                .distinct().collect(Collectors.toList());
+        repository.deleteBySourceTypeAndLabelsAndNameIn(SOURCE_TYPE, label, toEmbed); // PostgreSQL
+        int embedded = 0;
+        for (int i = 0; i < toEmbed.size(); i += EMBED_BATCH) {
+            List<String> batch = toEmbed.subList(i, Math.min(i + EMBED_BATCH, toEmbed.size()));
+            List<float[]> vectors = jina.embed(batch);
+            List<BikeEmbedding> rows = new ArrayList<>();
+            for (int j = 0; j < batch.size(); j++) {
+                String name = batch.get(j);
+                rows.add(new BikeEmbedding(SOURCE_TYPE, label + "_" + Math.abs(name.hashCode()), name, label, name,
+                        floatArrayToVectorString(vectors.get(j)), "jina", vectors.get(j).length));
+            }
+            repository.saveAll(rows); // PostgreSQL
+            embedded += batch.size();
+        }
+        if (!chunkTexts.isEmpty()) {
+            List<float[]> vectors = jina.embed(chunkTexts);
+            List<BikeEmbedding> rows = new ArrayList<>();
+            for (int ci = 0; ci < chunkIds.size(); ci++) {
+                rows.add(new BikeEmbedding(CHUNK_SOURCE_TYPE, label + "_ck_" + Math.abs(chunkIds.get(ci).hashCode()),
+                        chunkIds.get(ci), label, chunkTexts.get(ci),
+                        floatArrayToVectorString(vectors.get(ci)), "jina", vectors.get(ci).length));
+            }
+            repository.saveAll(rows); // PostgreSQL
+            embedded += chunkTexts.size();
+        }
+        return embedded;
+    }
+
+    /** Mirrors the finished graph to TriplyDB (async, failures only logged). */
+    public void mirror(String label) {
+        triply.syncGraphAsync(label);
+    }
+
+    public ExecutorService executor() {
+        return executor;
+    }
+
+    public Session openSession() {
+        return driver.session(); // Neo4j
+    }
+
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    private void send(SseEmitter emitter, String event, Object data) throws IOException {
+    public void send(SseEmitter emitter, String event, Object data) throws IOException {
         emitter.send(SseEmitter.event().name(event).data(objectMapper.writeValueAsString(data)));
     }
 
