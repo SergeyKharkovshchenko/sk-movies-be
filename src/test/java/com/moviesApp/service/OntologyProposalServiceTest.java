@@ -77,6 +77,46 @@ class OntologyProposalServiceTest {
     }
 
     @Test
+    void suggestedAttributesNeedAQuotedSentenceAndKnownTypes() throws Exception {
+        String text = "Hotel Atlas is 6 minutes from Munich Hbf. Hotel River is cheaper but 25 minutes away.";
+        Map<OntologyStage, Map<String, Object>> approved = new EnumMap<>(OntologyStage.class);
+        approved.put(OntologyStage.SOURCE, Map.of("kind", "text", "text", text));
+        approved.put(OntologyStage.VOCABULARY, Map.of("terms", List.of(
+                Map.of("term", "Hotel Atlas", "type", "Hotel", "aliases", List.of()),
+                Map.of("term", "Munich Hbf", "type", "Station", "aliases", List.of()))));
+        when(drafts.approvedPayloads("kb")).thenReturn(approved);
+        when(drafts.save(anyString(), any(OntologyStage.class), any())).thenAnswer(inv -> inv.getArgument(2));
+        when(openAi.chatDesign(anyString(), anyString(), anyInt())).thenReturn("""
+                {"attributes": [
+                  {"name": "Walking Minutes", "datatype": "number", "appliesTo": ["hotel", "Moon"],
+                   "description": "walk to the station", "example": "Hotel Atlas is 6 minutes from Munich Hbf."},
+                  {"name": "star_rating", "datatype": "number", "appliesTo": ["Hotel"],
+                   "example": "Hotel Atlas has four stars."},
+                  {"name": "walking_minutes", "datatype": "number", "appliesTo": [],
+                   "example": "Hotel River is cheaper but 25 minutes away."}
+                ]}""");
+
+        Map<String, Object> out = service.propose("kb", OntologyStage.METADATA);
+
+        List<Map<String, Object>> attributes = OntologyRules.listOf(out, "entityAttributes");
+        // the invented star rating is dropped, the duplicate name is dropped, the type is normalised
+        assertEquals(1, attributes.size());
+        assertEquals("walking_minutes", attributes.get(0).get("name"));
+        assertEquals(List.of("Hotel"), attributes.get(0).get("appliesTo"));
+    }
+
+    @Test
+    void anAttributeCannotApplyToATypeTheVocabularyLacks() {
+        Map<String, Object> vocab = Map.of("terms", List.of(Map.of("term", "Hotel Atlas", "type", "Hotel")));
+        Map<String, Object> metadata = Map.of("entityAttributes", List.of(
+                Map.of("name", "walking_minutes", "datatype", "number", "appliesTo", List.of("Hotel", "Moon"))));
+        List<String> errors = OntologyRules.validateMetadata(metadata, vocab);
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0).contains("Moon"));
+        assertEquals(List.of(), OntologyRules.validateMetadata(metadata));
+    }
+
+    @Test
     void aStageCannotBeProposedBeforeThePreviousOneIsApproved() {
         when(drafts.approvedPayloads("kb")).thenReturn(new EnumMap<>(OntologyStage.class));
         IllegalStateException e = assertThrows(IllegalStateException.class,
