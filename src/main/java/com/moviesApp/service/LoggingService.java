@@ -46,7 +46,9 @@ public class LoggingService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(LoggingService.class);
     private static final int MAX_FIELD_LENGTH = 4000;
-    private static final Path ROOT_CREDENTIALS = Path.of("credentials.json");
+    // Also checked under sk-movies-be/ for when the app is started from the parent workspace folder.
+    private static final Path ROOT_CREDENTIALS = Files.exists(Path.of("credentials.json"))
+            ? Path.of("credentials.json") : Path.of("sk-movies-be", "credentials.json");
 
     private final Logging logging;
     private final String logName;
