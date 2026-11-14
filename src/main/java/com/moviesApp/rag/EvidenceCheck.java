@@ -54,6 +54,25 @@ public final class EvidenceCheck {
         return new Verbatim(String.join(" ", kept), dropped);
     }
 
+    /**
+     * Sentences of the chunk that none of the kept evidence quotes cover -- candidates for a second
+     * extraction pass. Headings and fragments under three words are skipped (they state no fact).
+     */
+    public static java.util.List<String> uncoveredSentences(String chunk, java.util.List<String> evidences) {
+        java.util.List<String> covered = evidences.stream()
+                .filter(e -> e != null && !e.isBlank())
+                .map(e -> stripEndPunctuation(normalize(e)))
+                .toList();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String raw : chunk.strip().split("(?<=[.!?])\\s+|\\n\\s*\\n")) {
+            String s = raw.strip();
+            if (s.isEmpty() || s.startsWith("#") || s.split("\\s+").length < 3) continue;
+            String n = stripEndPunctuation(normalize(s));
+            if (covered.stream().noneMatch(c -> c.equals(n) || c.contains(n) || n.contains(c))) out.add(s);
+        }
+        return out;
+    }
+
     /** True when the entity name occurs in the source text (closed world for entities, too). */
     public static boolean occursIn(String sourceText, String name) {
         return mentions(normalize(sourceText), name);
@@ -86,7 +105,11 @@ public final class EvidenceCheck {
         String noArticle = LEADING_ARTICLE.matcher(n).replaceFirst("");
         if (!noArticle.equals(n) && (i = phraseIndex(normalizedText, noArticle)) >= 0) return i;
         String[] words = noArticle.split(" ");
-        if (words.length >= 2) {
+        // Last-word fallback is for people ("Nolan" for "Christopher Nolan"). Names that start with
+        // an article are titles, and titles share last words ("The Broken Ledger" / "The Amber
+        // Ledger") -- matching on the last word would accept a sentence about the other movie.
+        boolean title = !noArticle.equals(n);
+        if (!title && words.length >= 2) {
             String last = words[words.length - 1];
             if (last.length() >= 4) return phraseIndex(normalizedText, last);
         }
