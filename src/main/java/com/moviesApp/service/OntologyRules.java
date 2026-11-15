@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * Payload shapes:
  * <pre>
  * vocabulary: {terms: [{term, type, aliases: [..], definition}]}
- * metadata:   {entityAttributes: [{name, datatype, required}], relationAttributes: [..]}
+ * metadata:   {entityAttributes: [{name, datatype, required, appliesTo: [term types; empty = all], description, example}], relationAttributes: [..]}
  * taxonomy:   {pairs: [{parent, child, evidence}]}
  * ontology:   {classes: [{name, parent, description}], relations: [{name, domain, range, description}]}
  * </pre>
@@ -94,7 +94,7 @@ public final class OntologyRules {
         return switch (stage) {
             case SOURCE -> validateSource(payload);
             case VOCABULARY -> validateVocabulary(payload);
-            case METADATA -> validateMetadata(payload);
+            case METADATA -> validateMetadata(payload, approved.get(OntologyStage.VOCABULARY));
             case TAXONOMY -> validateTaxonomy(payload, approved.get(OntologyStage.VOCABULARY));
             case ONTOLOGY -> validateOntology(payload, approved.get(OntologyStage.VOCABULARY));
             case POPULATION -> List.of();
@@ -134,7 +134,13 @@ public final class OntologyRules {
     }
 
     static List<String> validateMetadata(Map<String, Object> p) {
+        return validateMetadata(p, null);
+    }
+
+    static List<String> validateMetadata(Map<String, Object> p, Map<String, Object> vocabulary) {
         List<String> errors = new ArrayList<>();
+        Set<String> types = new HashSet<>();
+        if (vocabulary != null) listOf(vocabulary, "terms").forEach(t -> types.add(norm(str(t, "type"))));
         for (String key : List.of("entityAttributes", "relationAttributes")) {
             Set<String> names = new HashSet<>();
             for (Map<String, Object> a : listOf(p, key)) {
@@ -146,6 +152,14 @@ public final class OntologyRules {
                 if (!names.add(norm(name))) errors.add("Attribute \"" + name + "\" is listed twice.");
                 if (!DATATYPES.contains(str(a, "datatype"))) {
                     errors.add("Attribute \"" + name + "\" needs a datatype: " + String.join(", ", DATATYPES) + ".");
+                }
+                if (vocabulary != null) {
+                    for (String t : strings(a.get("appliesTo"))) {
+                        if (!types.contains(norm(t))) {
+                            errors.add("Attribute \"" + name + "\" applies to \"" + t
+                                    + "\", which is not a term type in the vocabulary.");
+                        }
+                    }
                 }
             }
         }

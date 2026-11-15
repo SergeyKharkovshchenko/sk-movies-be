@@ -69,7 +69,7 @@ public class OntologyProposalService {
 
         Map<String, Object> payload = switch (stage) {
             case VOCABULARY -> csv ? csvStage(source, "vocabulary") : textVocabulary(str(source, "text"));
-            case METADATA -> csv ? csvStage(source, "metadata") : textMetadata();
+            case METADATA -> csv ? csvStage(source, "metadata") : textMetadata(str(source, "text"), vocabulary);
             case TAXONOMY -> csv
                     ? restrictTaxonomy(csvStage(source, "taxonomy"), vocabulary)
                     : textTaxonomy(str(source, "text"), vocabulary);
@@ -156,11 +156,85 @@ public class OntologyProposalService {
 
     // ── text: metadata, taxonomy, ontology ──────────────────────────────────────
 
-    private static Map<String, Object> textMetadata() {
+    private static final String METADATA_PROMPT = """
+            You get the SOURCE TEXT of a knowledge base and the entity TYPES in it, each with a few
+            example entity names. Propose the extra attributes (properties) worth keeping on entities of
+            these types: facts that the text states as a value, such as a price, time, date, duration,
+            count, amount or status.
+            For each attribute return:
+            - "name": snake_case, e.g. "walking_minutes"
+            - "datatype": one of string, number, date, boolean
+            - "appliesTo": the types (from the list) whose entities carry it
+            - "description": a few words on what it means
+            - "example": ONE sentence copied verbatim from the text that states a value of this attribute
+              for an entity. Never write it yourself.
+
+            CLOSED WORLD: only attributes whose value the text actually states. Skip an attribute when
+            you cannot quote such a sentence. Do not propose "name", "description" or provenance fields.
+            Return ONLY a JSON object, no markdown:
+            {"attributes": [{"name": "...", "datatype": "...", "appliesTo": ["..."], "description": "...", "example": "..."}]}
+            """;
+
+    private Map<String, Object> textMetadata(String text, Map<String, Object> vocabulary) throws Exception {
+        Map<String, List<String>> byType = new LinkedHashMap<>();
+        for (Map<String, Object> t : listOf(vocabulary, "terms")) {
+            String type = str(t, "type");
+            if (type.isEmpty() || str(t, "term").isEmpty()) continue;
+            List<String> names = byType.computeIfAbsent(type, k -> new ArrayList<>());
+            if (names.size() < 4) names.add(str(t, "term"));
+        }
+        List<Map<String, Object>> attributes = List.of();
+        if (!byType.isEmpty() && !text.isBlank()) {
+            StringBuilder types = new StringBuilder();
+            byType.forEach((type, names) ->
+                    types.append("- ").append(type).append(": ").append(String.join(", ", names)).append('\n'));
+            String response = openAi.chatDesign(METADATA_PROMPT,
+                    "SOURCE TEXT:\n" + text + "\n\nTYPES:\n" + types, 4000).strip();
+            if (response.startsWith("```")) {
+                response = response.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = mapper.readValue(response, Map.class);
+            attributes = checkedAttributes(parsed, text, byType.keySet());
+        }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("provenance", PROVENANCE);
-        out.put("entityAttributes", List.of());
+        out.put("entityAttributes", attributes);
         out.put("relationAttributes", List.of());
+        return out;
+    }
+
+    /**
+     * Keeps a suggested attribute only if it is well formed and its example sentence really occurs in
+     * the text (closed world: no attribute from the model's own knowledge). Types it names that the
+     * vocabulary does not have are dropped; an empty appliesTo means every type.
+     */
+    static List<Map<String, Object>> checkedAttributes(Map<String, Object> parsed, String text, Set<String> types) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>(PROVENANCE);
+        seen.add("name");
+        seen.add("description");
+        for (Map<String, Object> a : listOf(parsed, "attributes")) {
+            String name = str(a, "name").toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "_").replaceAll("^_+|_+$", "");
+            String datatype = str(a, "datatype").toLowerCase(Locale.ROOT);
+            String example = str(a, "example");
+            if (name.isEmpty() || !OntologyRules.DATATYPES.contains(datatype) || !seen.add(name)) continue;
+            EvidenceCheck.Verbatim v = EvidenceCheck.keepVerbatim(text, example);
+            if (v.kept().isBlank() || !v.dropped().isEmpty()) continue;
+            List<String> applies = new ArrayList<>();
+            for (String t : strings(a.get("appliesTo"))) {
+                types.stream().filter(x -> x.equalsIgnoreCase(t.strip())).findFirst()
+                        .filter(x -> !applies.contains(x)).ifPresent(applies::add);
+            }
+            Map<String, Object> attribute = new LinkedHashMap<>();
+            attribute.put("name", name);
+            attribute.put("datatype", datatype);
+            attribute.put("required", false);
+            attribute.put("appliesTo", applies);
+            attribute.put("description", str(a, "description"));
+            attribute.put("example", example);
+            out.add(attribute);
+        }
         return out;
     }
 
