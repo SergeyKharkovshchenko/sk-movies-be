@@ -200,6 +200,9 @@ public class OntologyProposalService {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("provenance", PROVENANCE);
         out.put("entityAttributes", attributes);
+        // Everything the AI proposed, kept even when the user removes a row: the editor offers these names
+        // in the Name field and fills the rest of the row when one is picked.
+        out.put("suggestions", attributes);
         out.put("relationAttributes", List.of());
         return out;
     }
