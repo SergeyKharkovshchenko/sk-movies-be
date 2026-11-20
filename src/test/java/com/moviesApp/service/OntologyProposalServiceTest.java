@@ -103,6 +103,7 @@ class OntologyProposalServiceTest {
         assertEquals(1, attributes.size());
         assertEquals("walking_minutes", attributes.get(0).get("name"));
         assertEquals(List.of("Hotel"), attributes.get(0).get("appliesTo"));
+        assertEquals(attributes, OntologyRules.listOf(out, "suggestions"));
     }
 
     @Test
